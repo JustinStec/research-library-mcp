@@ -1796,7 +1796,7 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
         // Banned filler verbs (explicit). "bears"/"holds" as the verb, with idiom
         // carve-outs (bear in mind; holds that/true/good/for). NOTE: "the thesis
         // holds" (= obtains) also trips — flagged per instruction; recast or ignore.
-        const bannedVerb = paraStripped.match(/\bbears?\b(?!\s+in\s+mind)|\bbearing\b|\bborne\b|\bholds?\b(?!\s+(?:that|true|good|for)\b)/i);
+        const bannedVerb = paraStripped.match(/\bbears?\b(?!\s+in\s+mind)|\bbearing\b|\bborne\b|\bholds?\b(?!\s+(?:that|true|good|for)\b)|\bcarr(?:y|ies|ied|ying)\b(?!\s+(?:out|on)\b)/i);
         if (bannedVerb)
             violations.push({ rule: "banned_verb", paragraph: pNum, snippet: bannedVerb[0], note: `"${bannedVerb[0]}" is a banned filler verb — replace with a verb that names the specific operation (what does the thing actually do to its object?)` });
         // Catch phrases (multi-word locutions). Match on quote-stripped text so
