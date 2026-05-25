@@ -2,22 +2,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import OpenAI from "openai";
-// Supabase configuration — from environment only (no secrets in source).
+// Supabase configuration
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("Missing required Supabase environment variables: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY");
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-// OpenAI embedding API (text-embedding-3-small, 1536 dims). Constructed lazily
-// so the server starts without OPENAI_API_KEY — only the embedding/semantic
-// tools require it, and they fail with a clear message if it is missing.
+// OpenAI embedding API (text-embedding-3-small, 1536 dims)
 let _openai: OpenAI | null = null;
 function getOpenAI(): OpenAI {
     if (!_openai) {
-        if (!process.env.OPENAI_API_KEY) {
-            throw new Error("OPENAI_API_KEY is required for embedding / semantic-search tools");
-        }
+        if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for embedding / semantic-search tools");
         _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     }
     return _openai;
@@ -49,9 +45,6 @@ function _errStr(err: any): string {
     }
     return _errStr(err);
 }
-// Factory: build a fully-configured server instance with all tools registered.
-// Transport-agnostic — stdio.ts and http.ts each create their own instance, so
-// one server is never connected to two transports at once.
 export function createServer(opts: { readOnly?: boolean } = {}) {
 const server = new McpServer({
     name: "research-library",
@@ -65,10 +58,7 @@ How to handle tool results:
 
 The skill file has the full catalog of file_name values needed for library_get_text.`,
 });
-// Read-only gating (opt-in via http.ts when MCP_READONLY is set). A public,
-// service-role-backed endpoint should expose only safe read/search/verify tools,
-// so wrap server.tool to make any non-allowlisted registration a no-op. The
-// stdio entrypoint (Claude Desktop) passes no opts and keeps the full toolset.
+// Read-only gating (opt-in via http.ts when MCP_READONLY is set).
 if (opts.readOnly) {
     const allow = new Set([
         "library_search", "library_semantic_search", "library_browse_category", "library_by_author",
@@ -81,8 +71,7 @@ if (opts.readOnly) {
         "readings_list_themes_concepts",
     ]);
     const origTool = server.tool.bind(server);
-    (server as any).tool = (name: string, ...rest: any[]) =>
-        allow.has(name) ? (origTool as any)(name, ...rest) : undefined;
+    (server as any).tool = (name: string, ...rest: any[]) => allow.has(name) ? (origTool as any)(name, ...rest) : undefined;
 }
 // Tool 1: Search readings by theme
 server.tool("readings_search_theme", "Search close readings by theme (e.g., dissociation, imagination, sensibility, synthesis, cognition, metaphysics, expression, poetics, aesthetics, perception, intuition, understanding, feeling, thought, sound, vision, unity, form, meaning, language)", {
@@ -1614,6 +1603,32 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
         "holds", "develops", "specifies", "establishes", "shows", "reveals",
         "demonstrates", "names", "transitions", "turns", "locates",
     ];
+    // Abstract nouns that genuinely cannot act — flagged as the agent of a person-
+    // verb whether or not they carry an article ("Diagnosis asks" drops the article
+    // to evade the IMPERSONAL_SUBJECTS form). Deliberately EXCLUDES the skill's
+    // licensed agents (the account, the analysis, the substitution, the predicative
+    // work, the picture, the centre) so the recommended fixes don't get flagged.
+    const IMPERSONAL_NOUNS = [
+        "criterion", "formula", "carrier", "exchange", "diagnosis", "hylomorphism",
+        "reduction", "rubric", "deflation", "objectification", "configuration",
+    ];
+    // Action verbs an abstraction can't be the agent of (base + -s forms so a modal
+    // case like "a formula can wed" is caught alongside "the criterion relocates").
+    const IMPERSONAL_ACTION_VERBS = [
+        "relocates", "relocate", "occasions", "occasion", "weds", "wed", "fuses",
+        "fuse", "asks", "ask", "reaches", "reach", "does", "do", "makes", "make",
+        "keeps", "keep", "carries", "carry", "drops", "drop", "joins", "join",
+        "retires", "retire", "annihilates", "annihilate", "wants", "want",
+    ];
+    // Convergence / anticipation framing — never claim a source arrives at the same
+    // place as the position (read thinking-with, not as an ally who agrees).
+    const CONVERGENCE_PATTERNS = [
+        /\breach(?:es|ed)?\s+the\s+same\b/i,
+        /\banticipat(?:e|es|ed|ion|ing)\b/i,
+        /\bconverg(?:e|es|ed|ence|ing)\b/i,
+        /\barriv(?:e|es|ed)\s+at\s+the\s+same\b/i,
+        /\bthe\s+same\s+(?:structure|conclusion|move|result|account|point|position|diagnosis)\b/i,
+    ];
     const CONTRASTIVE_HINGES = [
         /\bnot\b[^,.;]{1,60},\s*but\b/i,
         /\brather than\b/i,
@@ -1697,11 +1712,11 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
     // interior of "…" / “…” / '…' / ‘…’ runs with spaces, preserving offsets.
     const stripQuoted = (text) =>
         text
-            .replace(/[“"']([^“”"']{0,400}?)[”"']/g, (m) => " ".repeat(m.length))
+            .replace(/[“"']([^“”"']{0,4000}?)[”"']/g, (m) => " ".repeat(m.length))
             // Curly single quotes ‘…’ (Justin's prose default per §Quotation
             // Protection). Safe against possessives: a possessive uses ’ (U+2019)
             // alone, which can't open a span without a leading ‘ (U+2018).
-            .replace(/‘([^‘’]{0,400}?)’/g, (m) => " ".repeat(m.length));
+            .replace(/‘([^‘’]{0,4000}?)’/g, (m) => " ".repeat(m.length));
     // Stative / adjectival past-participles. "is grounded in", "is based on",
     // "is concerned with" etc. are copular + adjective, not eventive passives —
     // flagging them was the bulk of possible_passive's false positives (25%
@@ -1774,10 +1789,16 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
         // Banned words
         for (const w of BANNED_WORDS) {
             const re = new RegExp(`\\b${w}\\b`, "i");
-            const m = para.match(re);
+            const m = paraStripped.match(re);
             if (m)
                 violations.push({ rule: "banned_word", paragraph: pNum, snippet: m[0], note: w });
         }
+        // Banned filler verbs (explicit). "bears"/"holds" as the verb, with idiom
+        // carve-outs (bear in mind; holds that/true/good/for). NOTE: "the thesis
+        // holds" (= obtains) also trips — flagged per instruction; recast or ignore.
+        const bannedVerb = paraStripped.match(/\bbears?\b(?!\s+in\s+mind)|\bbearing\b|\bborne\b|\bholds?\b(?!\s+(?:that|true|good|for)\b)/i);
+        if (bannedVerb)
+            violations.push({ rule: "banned_verb", paragraph: pNum, snippet: bannedVerb[0], note: `"${bannedVerb[0]}" is a banned filler verb — replace with a verb that names the specific operation (what does the thing actually do to its object?)` });
         // Catch phrases (multi-word locutions). Match on quote-stripped text so
         // a catch-phrase quoted FROM a source ("the fuel and fire of thinking")
         // isn't charged against the author's own prose.
@@ -1800,35 +1821,58 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
         // Naming predicates (as predicate, with subject right before)
         for (const pred of NAMING_PREDICATES) {
             const re = new RegExp(`\\b[A-Za-z]+\\s+${pred}\\b`, "i");
-            const m = para.match(re);
+            const m = paraStripped.match(re);
             if (m)
                 violations.push({ rule: "naming_predicate", paragraph: pNum, snippet: m[0], note: pred });
         }
         // Revelation verbs
         for (const v of REVELATION_VERBS) {
             const re = new RegExp(`\\b${v}\\b`, "i");
-            const m = para.match(re);
+            const m = paraStripped.match(re);
             if (m)
                 violations.push({ rule: "revelation_verb", paragraph: pNum, snippet: m[0], note: v });
         }
         // "Conceptual force"
-        if (/\bconceptual force\b/i.test(para)) {
+        if (/\bconceptual force\b/i.test(paraStripped)) {
             violations.push({ rule: "conceptual_force", paragraph: pNum, snippet: "conceptual force" });
         }
         // Impersonal noun-phrase subjects: "The article claims" etc.
         for (const subj of IMPERSONAL_SUBJECTS) {
             for (const v of IMPERSONAL_VERBS) {
                 const re = new RegExp(`\\b${subj}\\s+${v}\\b`, "i");
-                const m = para.match(re);
+                const m = paraStripped.match(re);
                 if (m)
                     violations.push({ rule: "impersonal_subject", paragraph: pNum, snippet: m[0] });
             }
         }
         // Contrastive hinges
         for (const re of CONTRASTIVE_HINGES) {
-            const m = para.match(re);
+            const m = paraStripped.match(re);
             if (m)
                 violations.push({ rule: "contrastive_hinge", paragraph: pNum, snippet: m[0].trim().slice(0, 100) });
+        }
+        // Can't-act abstraction as the agent of a person-verb. Article-optional and
+        // modal-tolerant, so "the criterion relocates", "an exchange occasions", the
+        // article-dropped "Diagnosis asks", and "a formula can wed" all trip.
+        for (const noun of IMPERSONAL_NOUNS) {
+            const re = new RegExp(`(?:^|[.;:!?]\\s+|\\b(?:the|a|an|this|that|its|their)\\s+)${noun}\\s+(?:(?:can|could|may|must|will|would|should)\\s+)?(${IMPERSONAL_ACTION_VERBS.join("|")})\\b`, "i");
+            const m = paraStripped.match(re);
+            if (m)
+                violations.push({ rule: "impersonal_subject", paragraph: pNum, snippet: m[0].trim().slice(0, 80), note: `"${noun}" cannot be the agent of "${m[1]}" — name the actual actor (a centre, the account, Eliot) or recast so a person/located subject acts` });
+        }
+        // Empty-agency tell: an abstraction "doing the work".
+        const doesWork = paraStripped.match(/\b(?:does|do|doing|did)\s+the\s+work\b/i);
+        if (doesWork)
+            violations.push({ rule: "empty_agency", paragraph: pNum, snippet: doesWork[0], note: `"${doesWork[0]}" is empty agency — name what the thing specifically does, not that it "does the work"` });
+        // Copular non-thoughts: "becomes useful/usable/…", "falls away", "comes into view".
+        const copula = paraStripped.match(/\bbecomes?\s+(?:useful|usable|available|possible|clear|apparent|evident|visible|intelligible|legible|relevant|tractable|accessible|necessary|meaningful)\b|\bfalls?\s+away\b|\bcomes?\s+into\s+(?:view|focus)\b/i);
+        if (copula)
+            violations.push({ rule: "empty_copula", paragraph: pNum, snippet: copula[0].trim(), note: `"${copula[0].trim()}" is a copular non-thought — say what specifically changes and what does the changing, not that something "becomes X"` });
+        // Convergence / anticipation claims.
+        for (const re of CONVERGENCE_PATTERNS) {
+            const m = paraStripped.match(re);
+            if (m)
+                violations.push({ rule: "convergence_claim", paragraph: pNum, snippet: m[0].trim(), note: `"${m[0].trim()}" frames a source as converging with / anticipating the position — read the source thinking-with, never as arriving at the same place` });
         }
         // Vague framing / filler phrases (quote-stripped — don't flag a quoted source)
         const paraNoQuote = stripQuoted(para);
@@ -2069,18 +2113,35 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
         // contested word") + generic noun. Track distinct sentences AND total
         // count, so a long paragraph (≥3 sentences) and a compressed one (≥4
         // total) both trip.
+        // GENERIC totem detection: ANY head noun repeated as a determined NP
+        // ("the X", "a contested Y") — not a fixed list — so novel totems ("the
+        // carrier", "the apparatus", "the field", "the position") are caught, not
+        // just word/term/concept. Quote-stripped; determiner-anchored (keeps it off
+        // "in other words"); a head noun is the last word after determiner + up to
+        // two adjectives. Advisory by nature: a noun repeated because it is the
+        // paragraph's load-bearing technical term is NOT a totem — the swap-for-X
+        // test decides, which a regex cannot. "point of view"/"of departure" exempt.
+        const TOTEM_STOP = new Set([  // structural/meta nouns that recur legitimately
+            "essay", "article", "section", "paragraph", "sentence", "chapter", "page",
+            "reader", "writer", "author", "example", "case", "time", "fact", "kind",
+            "sort", "part", "above", "below",
+        ]);
         const totem = new Map();
         sentences.forEach((s, sIdx) => {
             const txt = stripQuoted(s);
-            const re = /\b(?:the|a|an|this|that|its|their|each|every)\s+(?:[a-z]{2,}\s+){0,2}(words?|terms?|concepts?|notions?|ideas?|points?|things?|questions?)\b/gi;
+            // determiner + the immediate head noun (≥4 letters). No adjective-skip:
+            // a greedy skip eats the noun ("the carrier does the work" → "work"),
+            // so we take the first content word after the determiner. Catches the
+            // bare-totem shape ("the carrier", "the apparatus", "the field") that is
+            // how totems actually appear.
+            const re = /\b(?:the|a|an|this|that|these|those|its|their|each|every|such)\s+([a-z]{4,})\b/gi;
             let m;
             while ((m = re.exec(txt)) !== null) {
-                // "point of view" / "point of departure" are fixed technical phrases
-                // (load-bearing in philosophy-of-mind prose), not the generic-"point"
-                // totem — don't count them.
-                if (/^points?$/i.test(m[1]) && /^\s+of\s+(?:view|departure)/i.test(txt.slice(re.lastIndex)))
+                const head = m[1].toLowerCase();
+                if (/^points?$/.test(head) && /^\s+of\s+(?:view|departure)/i.test(txt.slice(re.lastIndex)))
                     continue;
-                const lemma = m[1].toLowerCase().replace(/s$/, "");
+                const lemma = head.replace(/s$/, "");
+                if (TOTEM_STOP.has(lemma)) continue;
                 if (!totem.has(lemma))
                     totem.set(lemma, { sents: new Set(), count: 0 });
                 const rec = totem.get(lemma);
@@ -2089,12 +2150,13 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
             }
         });
         totem.forEach((rec, lemma) => {
-            if (rec.sents.size >= 3 || rec.count >= 4) {
+            // 4+ distinct sentences anchored on it, or 5+ uses in close proximity
+            if (rec.sents.size >= 4 || rec.count >= 5) {
                 violations.push({
                     rule: "noun_totem",
                     paragraph: pNum,
                     snippet: `"the ${lemma}" ×${rec.count} across ${rec.sents.size} sentences`,
-                    note: `the generic noun "${lemma}" repeats as a determined subject/object (${rec.count}×) — vary the referring expression so each instance specifies (e.g. the sign, the inherited meaning, the principles) instead of droning the same anchor word`,
+                    note: `"${lemma}" repeats as a determined noun ${rec.count}× — if its invocation has replaced specification it is a totem (vary the referring expression so each use specifies a different aspect); if each use genuinely brings a new aspect it is a load-bearing term, disregard via the swap-for-X test`,
                 });
             }
         });
