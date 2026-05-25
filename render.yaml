@@ -1,0 +1,22 @@
+# Render blueprint for the research-library MCP server (remote HTTPS /mcp for ChatGPT).
+# Deploy: Render dashboard → New → Blueprint → connect this repo → set the env vars below.
+# Render injects PORT automatically; http.ts reads process.env.PORT.
+services:
+  - type: web
+    name: research-library-mcp
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node dist/http.js
+    healthCheckPath: /health
+    envVars:
+      - key: SUPABASE_URL
+        sync: false               # set in dashboard
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false               # set in dashboard (secret)
+      - key: OPENAI_API_KEY
+        sync: false               # set in dashboard (enables semantic search + find_quote fuzzy)
+      - key: MCP_BEARER_TOKEN
+        sync: false               # set in dashboard; leave blank for no-auth (see note)
+      - key: MCP_READONLY
+        value: ""                 # "" = full toolset incl. drafts_check_style; "1" = read-only

@@ -1,0 +1,25 @@
+{
+  "name": "research-library-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for querying Close Readings and Academic Library databases",
+  "type": "module",
+  "main": "dist/stdio.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/stdio.js",
+    "start:stdio": "node dist/stdio.js",
+    "start:http": "node dist/http.js",
+    "dev:http": "tsc && node dist/http.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@supabase/supabase-js": "^2.39.0",
+    "express": "^5.2.1",
+    "openai": "^6.17.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}

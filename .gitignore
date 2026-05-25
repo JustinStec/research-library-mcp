@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+
+# stray root-level utility scripts (never part of the deployable server)
+/*.cjs
+/*.js
+/*.py
+/*.mjs
