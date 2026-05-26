@@ -1861,10 +1861,11 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
             if (m)
                 violations.push({ rule: "impersonal_subject", paragraph: pNum, snippet: m[0].trim().slice(0, 80), note: `"${noun}" cannot be the agent of "${m[1]}" — name the actual actor (a centre, the account, Eliot) or recast so a person/located subject acts` });
         }
-        // Empty-agency tell: an abstraction "doing the work".
-        const doesWork = paraStripped.match(/\b(?:does|do|doing|did)\s+the\s+work\b/i);
+        // Empty-agency tell: an abstraction "doing the X" — work / damage / heavy
+        // lifting / job / trick / rest. "The second stipulation does the damage."
+        const doesWork = paraStripped.match(/\b(?:does|do|doing|did)\s+the\s+(?:work|damage|heavy\s+lifting|lifting|legwork|job|trick|rest|business)\b/i);
         if (doesWork)
-            violations.push({ rule: "empty_agency", paragraph: pNum, snippet: doesWork[0], note: `"${doesWork[0]}" is empty agency — name what the thing specifically does, not that it "does the work"` });
+            violations.push({ rule: "empty_agency", paragraph: pNum, snippet: doesWork[0], note: `"${doesWork[0]}" is empty agency ("does the X") — name what the thing specifically does, not that it "does the ${doesWork[0].replace(/.*\bthe\s+/i, "")}"` });
         // Copular non-thoughts: "becomes useful/usable/…", "falls away", "comes into view".
         const copula = paraStripped.match(/\bbecomes?\s+(?:useful|usable|available|possible|clear|apparent|evident|visible|intelligible|legible|relevant|tractable|accessible|necessary|meaningful)\b|\bfalls?\s+away\b|\bcomes?\s+into\s+(?:view|focus)\b/i);
         if (copula)
