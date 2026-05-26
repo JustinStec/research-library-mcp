@@ -69,6 +69,7 @@ if (opts.readOnly) {
         "readings_list_all", "readings_get_content", "readings_get_related", "readings_search_author",
         "readings_search_concept", "readings_search_theme", "readings_search_content", "readings_semantic_search",
         "readings_list_themes_concepts",
+        "journal_list_models", "journal_project_draft", "journal_dependency_map", "journal_revision_plan",
     ]);
     const origTool = server.tool.bind(server);
     (server as any).tool = (name: string, ...rest: any[]) => allow.has(name) ? (origTool as any)(name, ...rest) : undefined;
@@ -2501,5 +2502,73 @@ server.tool("drafts_mine_patterns", "Run the style-pattern miner over the recent
         };
     }
 });
+
+// ===== Target-journal projector tools (theme + move models via the Modal endpoint) =====
+const TJ_ENDPOINT = "https://jts3et--nlh-draft-projector-fastapi-app.modal.run";
+const _tjText = async (text?: string, path?: string): Promise<string> => {
+    if (text && text.trim()) return text;
+    if (path) {
+        const fs = await import("node:fs/promises");
+        return (await fs.readFile(path, "utf8")).split(/^#\s*Notes\b/m)[0];
+    }
+    throw new Error("Provide `text` or `path`.");
+};
+const _tjPost = async (ep: string, body: unknown): Promise<unknown> => {
+    const r = await fetch(TJ_ENDPOINT + ep, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`projector ${ep} HTTP ${r.status}`);
+    return await r.json();
+};
+
+server.tool("journal_list_models", "List the trained target-journal models available for projection (NLH, ELH, Inquiry). Each is trained on that journal's published corpus: theme discourse-atoms + rhetorical move-atoms.", {}, async () => {
+    try {
+        const d: any = await (await fetch(TJ_ENDPOINT + "/journals")).json();
+        return { content: [{ type: "text", text: JSON.stringify(d.journals || d, null, 2) }] };
+    } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: String(err) }) }] };
+    }
+});
+
+server.tool("journal_project_draft", "Project a draft onto a target journal's trained model. Returns THEME fit (which discourse-atoms the draft loads on + nearest published essays by theme = cite-neighborhood) and the RHETORICAL move-arc (ordered move-atoms, profile vs corpus, opens/closes divergence, nearest essays by structure). (~25-40s)", {
+    text: z.string().optional().describe("The draft text (>=50 words). Provide this OR path."),
+    path: z.string().optional().describe("Server-side path to a draft file (local-only; use text remotely)."),
+    journal: z.string().default("Inquiry").describe("Target journal id (NLH | ELH | Inquiry)"),
+}, async ({ text, path, journal }) => {
+    try {
+        const d = await _tjPost("/analyze", { text: await _tjText(text, path), journal });
+        return { content: [{ type: "text", text: JSON.stringify(d, null, 2) }] };
+    } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: String(err) }) }] };
+    }
+});
+
+server.tool("journal_dependency_map", "Map a draft's LOGICAL paragraph-dependency structure (journal-independent): spine (hub paragraphs many depend on), free joints (paragraphs nothing depends on = movable), cycles (mutual presupposition = defects), used-before-defined violations, per-paragraph feasible position windows. (~40-100s)", {
+    text: z.string().optional().describe("The draft text (>=50 words). Provide this OR path."),
+    path: z.string().optional().describe("Server-side path to a draft file (local-only)."),
+}, async ({ text, path }) => {
+    try {
+        const d = await _tjPost("/sequence", { text: await _tjText(text, path) });
+        return { content: [{ type: "text", text: JSON.stringify(d, null, 2) }] };
+    } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: String(err) }) }] };
+    }
+});
+
+server.tool("journal_revision_plan", "Build a revision plan reshaping a draft toward a target journal: paragraph worklist (priority/issue/action), over-indexed and corpus-common-but-missing moves, opener/close rewrites, optional body re-compose suggestions. (~60-120s; may exceed short MCP client timeouts.)", {
+    text: z.string().optional().describe("The draft text (>=50 words). Provide this OR path."),
+    path: z.string().optional().describe("Server-side path to a draft file (local-only)."),
+    journal: z.string().default("Inquiry").describe("Target journal id"),
+    target_fn: z.string().optional().describe("Optional file_name of a corpus essay to reshape toward."),
+    body: z.boolean().default(false).describe("Include body-paragraph rewrite suggestions (slower)."),
+}, async ({ text, path, journal, target_fn, body }) => {
+    try {
+        const d = await _tjPost("/revise", { text: await _tjText(text, path), journal, target_fn, body });
+        return { content: [{ type: "text", text: JSON.stringify(d, null, 2) }] };
+    } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: String(err) }) }] };
+    }
+});
+
     return server;
 }
