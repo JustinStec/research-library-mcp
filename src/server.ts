@@ -2520,6 +2520,54 @@ const _tjPost = async (ep: string, body: unknown): Promise<unknown> => {
     if (!r.ok) throw new Error(`projector ${ep} HTTP ${r.status}`);
     return await r.json();
 };
+// Compact digests — raw JSON.stringify of projector responses truncates in MCP transport.
+const _tjFmtAnalyze = (d: any): string => {
+    if (d.error) return "Error: " + d.error;
+    const L: string[] = [`THEME + RHETORIC — ${d.journal_label || d.journal} (${d.words} words)`];
+    const th = d.theme || {};
+    if (th.top_atoms?.length) L.push("Theme atoms: " + th.top_atoms.map((a: any) => `${a.name} ${a.pct}%`).join(", "));
+    if (th.siblings?.length) L.push("Nearest by theme: " + th.siblings.map((s: any) => `${s.title} (${s.sim})`).join("; "));
+    if (d.theme_error) L.push("theme_error: " + d.theme_error);
+    const rh = d.rhetoric || {};
+    if (rh.n_moves) L.push(`\nRhetoric: ${rh.n_moves} moves`);
+    const dv = rh.divergence || {};
+    if (dv.opens) L.push(`Opens: ${dv.opens} (corpus: ${dv.corpus_opens}) | Closes: ${dv.closes} (corpus: ${dv.corpus_closes})`);
+    if (dv.missing?.length) L.push("Missing corpus moves: " + dv.missing.join("; "));
+    if (rh.profile?.length) L.push("Move profile vs corpus: " + rh.profile.slice(0, 6).map((p: any) => `${p.name} ${p.pct}% (corpus ${p.corpus}%)`).join("; "));
+    if (rh.nearest?.length) L.push("Nearest by structure: " + rh.nearest.map((s: any) => `${s.title} (${s.sim})`).join("; "));
+    if (d.rhetoric_error) L.push("rhetoric_error: " + d.rhetoric_error);
+    return L.join("\n");
+};
+const _tjFmtSeq = (d: any): string => {
+    if (d.error) return "Error: " + d.error;
+    const ps = d.paragraphs || [];
+    const free = ps.filter((p: any) => p.out === 0);
+    const hubs = [...ps].sort((a: any, b: any) => b.out - a.out).slice(0, 4);
+    const L: string[] = [`DEPENDENCY MAP — ${d.n} paragraphs · ${(d.edges || []).length} deps · ${(d.cycles || []).length} cycles · ${(d.violations || []).length} used-before-defined · ${free.length} free joints`];
+    L.push("Spine (hubs): " + hubs.map((p: any) => `¶${p.id} (out=${p.out}) ${(p.label || "").slice(0, 40)}`).join(" | "));
+    L.push("Free joints (movable): " + free.map((p: any) => `¶${p.id}${p.win ? ` [ranks ${p.win[0] + 1}-${p.win[1] + 1}]` : ""}`).join(", "));
+    if ((d.cycles || []).length) L.push("CYCLES: " + d.cycles.map((c: any) => "{" + c.map((x: any) => "¶" + x).join(" ") + "}").join(" "));
+    if ((d.violations || []).length) L.push("Used-before-defined: " + d.violations.map((v: any) => `¶${v[0]}<-¶${v[1]}`).join(", "));
+    const orph = Object.keys(d.orphans || {});
+    if (orph.length) L.push("Orphan terms in: " + orph.map(i => "¶" + i).join(", "));
+    return L.join("\n");
+};
+const _tjFmtRevise = (d: any): string => {
+    if (d.error) return "Error: " + d.error;
+    const p = d.plan || {};
+    const L: string[] = [`REVISION PLAN — ${d.journal || "?"} (${d.n_moves} moves, ${d.n_paragraphs} paras)`];
+    const dv = d.divergence || {};
+    if (dv.opens) L.push(`Opens: ${dv.opens} (corpus: ${dv.corpus_opens}) | Closes: ${dv.closes} (corpus: ${dv.corpus_closes})`);
+    if (dv.missing?.length) L.push("Missing corpus moves: " + dv.missing.join("; "));
+    (d.over_indexed || []).slice(0, 6).forEach((o: any) => L.push(`Over-indexed: ${o.atom} ${o.pct}% vs corpus ${o.corpus}% (¶${o.paras})`));
+    if (p.raw) { L.push("\n[plan returned as raw text — model JSON didn't fully parse]\n" + p.raw); return L.join("\n"); }
+    if (p.worklist?.length) { L.push("\nWorklist:"); p.worklist.forEach((w: any) => L.push(`  [${w.priority || ""}] ¶${w.paragraph ?? "-"}: ${w.issue || ""} -> ${w.action || ""}`)); }
+    if (p.opener_rewrite) L.push("\nOPENER REWRITE: " + p.opener_rewrite);
+    if (p.close_rewrite) L.push("\nCLOSE REWRITE: " + p.close_rewrite);
+    if (p.timeliness) L.push("\nTimeliness: " + p.timeliness);
+    if (d.body_suggestions?.length) L.push(`\n(+${d.body_suggestions.length} body-paragraph suggestions; re-run with body=true)`);
+    return L.join("\n");
+};
 
 server.tool("journal_list_models", "List the trained target-journal models available for projection (NLH, ELH, Inquiry). Each is trained on that journal's published corpus: theme discourse-atoms + rhetorical move-atoms.", {}, async () => {
     try {
@@ -2537,7 +2585,7 @@ server.tool("journal_project_draft", "Project a draft onto a target journal's tr
 }, async ({ text, path, journal }) => {
     try {
         const d = await _tjPost("/analyze", { text: await _tjText(text, path), journal });
-        return { content: [{ type: "text", text: JSON.stringify(d, null, 2) }] };
+        return { content: [{ type: "text", text: _tjFmtAnalyze(d) }] };
     } catch (err) {
         return { content: [{ type: "text", text: JSON.stringify({ error: String(err) }) }] };
     }
@@ -2549,7 +2597,7 @@ server.tool("journal_dependency_map", "Map a draft's LOGICAL paragraph-dependenc
 }, async ({ text, path }) => {
     try {
         const d = await _tjPost("/sequence", { text: await _tjText(text, path) });
-        return { content: [{ type: "text", text: JSON.stringify(d, null, 2) }] };
+        return { content: [{ type: "text", text: _tjFmtSeq(d) }] };
     } catch (err) {
         return { content: [{ type: "text", text: JSON.stringify({ error: String(err) }) }] };
     }
@@ -2564,7 +2612,7 @@ server.tool("journal_revision_plan", "Build a revision plan reshaping a draft to
 }, async ({ text, path, journal, target_fn, body }) => {
     try {
         const d = await _tjPost("/revise", { text: await _tjText(text, path), journal, target_fn, body });
-        return { content: [{ type: "text", text: JSON.stringify(d, null, 2) }] };
+        return { content: [{ type: "text", text: _tjFmtRevise(d) }] };
     } catch (err) {
         return { content: [{ type: "text", text: JSON.stringify({ error: String(err) }) }] };
     }
