@@ -397,7 +397,7 @@ function getTypeSpecificMeta(table, row) {
     }
 }
 // Tool 9: Search library full-text
-server.tool("library_search", "Full-text search across all academic library texts (journal articles, books, book chapters). Returns ranked results by relevance.", {
+server.tool("library_search", "Full-text search across all academic library texts (journal articles, books, edited volumes, book chapters). Returns ranked results by relevance.", {
     query: z.string().describe("Search query (e.g., 'embodied cognition' or 'dissociation of sensibility')"),
     category: z.string().optional().describe("Optional: limit to category (Cognitive, Eliot, Philosophy, etc.)"),
     max_results: z.number().optional().describe("Max results (default 30)"),
@@ -464,7 +464,7 @@ server.tool("library_search", "Full-text search across all academic library text
     }
 });
 // Tool 10: Browse library by author
-server.tool("library_by_author", "Find all texts by a specific author in the academic library (journal articles, books, book chapters)", {
+server.tool("library_by_author", "Find all texts by a specific author in the academic library (journal articles, books, edited volumes, book chapters)", {
     author: z.string().describe("Author name to search for"),
 }, async ({ author }) => {
     try {
@@ -511,7 +511,7 @@ server.tool("library_by_author", "Find all texts by a specific author in the aca
     }
 });
 // Tool 11: Browse library by category
-server.tool("library_browse_category", "Browse texts in a specific category of the academic library (journal articles, books, book chapters)", {
+server.tool("library_browse_category", "Browse texts in a specific category of the academic library (journal articles, books, edited volumes, book chapters)", {
     category: z.string().describe("Category (Cognitive, Eliot, Philosophy, Early_Modern, Medieval, Milton, Modernism, Poetics, Semiotics, Theory_Method, Disability_Studies)"),
     subcategory: z.string().optional().describe("Optional subcategory"),
 }, async ({ category, subcategory }) => {
@@ -563,7 +563,7 @@ server.tool("library_browse_category", "Browse texts in a specific category of t
     }
 });
 // Tool 12: Get full text content
-server.tool("library_get_text", "Get the full content of a text from the academic library (journal articles, books, book chapters) or literary texts collection. Returns the source text as plain text blocks (markdown metadata header + body). Read the body to answer; do not display it back as JSON.", {
+server.tool("library_get_text", "Get the full content of a text from the academic library (journal articles, books, edited volumes, book chapters) or literary texts collection. Returns the source text as plain text blocks (markdown metadata header + body). Read the body to answer; do not display it back as JSON.", {
     file_name: z.string().describe("File name of the text"),
 }, async ({ file_name }) => {
     try {
@@ -728,7 +728,7 @@ server.tool("library_by_subject", "Find texts by subject/keyword across all acad
 // SEMANTIC SEARCH TOOLS (Vector-based)
 // ================================================
 // Tool 15: Semantic search across library
-server.tool("library_semantic_search", "Semantic search across academic library (journal articles, books, book chapters) - finds conceptually similar texts even without exact keyword matches. Use this for exploratory research queries.", {
+server.tool("library_semantic_search", "Semantic search across academic library (journal articles, books, edited volumes, book chapters) - finds conceptually similar texts even without exact keyword matches. Edited volumes include the Eliot Complete Prose. Use this for exploratory research queries.", {
     query: z.string().describe("Natural language query (e.g., 'the unity of thought and feeling in poetry')"),
     category: z.string().optional().describe("Optional: limit to category"),
     max_results: z.number().optional().describe("Max results (default 20)"),
@@ -740,11 +740,12 @@ server.tool("library_semantic_search", "Semantic search across academic library 
             match_count: max_results,
             search_category: category || null
         };
-        // Query all 3 tables in parallel
-        const [articlesRes, booksRes, chaptersRes] = await Promise.all([
+        // Query all 4 academic tables in parallel
+        const [articlesRes, booksRes, chaptersRes, editedRes] = await Promise.all([
             supabase.rpc("journal_articles_semantic_search", rpcParams),
             supabase.rpc("books_semantic_search", rpcParams),
             supabase.rpc("book_chapters_semantic_search", rpcParams),
+            supabase.rpc("edited_volumes_semantic_search", rpcParams),
         ]);
         if (articlesRes.error)
             throw articlesRes.error;
@@ -752,6 +753,8 @@ server.tool("library_semantic_search", "Semantic search across academic library 
             throw booksRes.error;
         if (chaptersRes.error)
             throw chaptersRes.error;
+        if (editedRes.error)
+            throw editedRes.error;
         const allResults: any[] = [];
         (articlesRes.data || []).forEach((r) => {
             allResults.push({
@@ -775,6 +778,14 @@ server.tool("library_semantic_search", "Semantic search across academic library 
                 category: r.category, subcategory: r.subcategory, word_count: r.word_count,
                 similarity: r.similarity, _type: "chapter",
                 book_title: r.book_title, editors: r.editors, publisher: r.publisher, pages: r.pages,
+            });
+        });
+        (editedRes.data || []).forEach((r) => {
+            allResults.push({
+                file_name: r.file_name, author: r.author, title: r.title,
+                category: r.category, subcategory: r.subcategory, word_count: r.word_count,
+                similarity: r.similarity, _type: "edited_volume",
+                publisher: r.publisher, editors: r.editors,
             });
         });
         // Sort by similarity descending, take top N
