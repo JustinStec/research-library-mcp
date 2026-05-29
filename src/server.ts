@@ -3053,6 +3053,148 @@ Notes for the audit:
     },
 );
 
+// ============================================================================
+// drafts_source_audit — four-lens source-engagement audit
+// ============================================================================
+server.tool(
+    "drafts_source_audit",
+    "Four-lens source-engagement audit, run in a single Anthropic call. Identifies: (1) missing_citations — claims that need a source but lack one; (2) source_gaps — argument moves that rely on a kind of source (a school, a tradition, a sub-debate) the section does not yet cite; (3) completeness — for diagnostic sections especially, the field-coverage analysis (which positions does the argument range against, which are represented vs missing); (4) evidence_balance — claims whose strength exceeds the evidence actually provided. Optional library_search=true runs semantic search against the research-library corpus and asks the model which candidates are cited vs uncited-but-relevant. ~$0.06 per call (Sonnet 4.6 default), ~60s. Use after a section is composed, before drafting the bibliography, or when preparing for referee review. Requires ANTHROPIC_API_KEY.",
+    {
+        draft: z.string().describe("The section prose to audit. Paragraphs split on blank lines."),
+        project_slug: z.string().optional().describe("Optional project slug for persistence to drafts_source_audit_history."),
+        library_search: z.boolean().optional().default(false).describe("If true, run semantic search against the research-library for candidate sources and include them in the audit."),
+        library_search_query: z.string().optional().describe("Optional override for the library semantic-search query. Defaults to the first ~500 chars of the section."),
+        model: z.string().optional().default("claude-sonnet-4-6").describe("Anthropic model. Default Sonnet 4.6."),
+    },
+    async ({ draft, project_slug, library_search, library_search_query, model }) => {
+        try {
+            const anth = getAnthropic();
+            if (!anth) {
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: "drafts_source_audit requires ANTHROPIC_API_KEY in the MCP server's env." }, null, 2) }],
+                };
+            }
+            const rawParas = draft.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+            const numbered = rawParas.map((p, i) => `[¶${i + 1}]\n${p}`).join("\n\n");
+
+            let library_candidates_block = "";
+            let library_candidates: any[] = [];
+            if (library_search) {
+                try {
+                    const q = library_search_query || draft.slice(0, 600);
+                    const queryEmbedding = await getQueryEmbedding(q);
+                    const rpcParams = { query_embedding: queryEmbedding, match_count: 25, search_category: null };
+                    const [articlesRes, booksRes, chaptersRes, editedRes] = await Promise.all([
+                        supabase.rpc("journal_articles_semantic_search", rpcParams),
+                        supabase.rpc("books_semantic_search", rpcParams),
+                        supabase.rpc("book_chapters_semantic_search", rpcParams),
+                        supabase.rpc("edited_volumes_semantic_search", rpcParams),
+                    ]);
+                    const all: any[] = [];
+                    (articlesRes.data || []).forEach((r: any) => all.push({ file_name: r.file_name, author: r.author, title: r.title, year: r.year, type: "article", similarity: r.similarity }));
+                    (booksRes.data || []).forEach((r: any) => all.push({ file_name: r.file_name, author: r.author, title: r.title, year: r.year, type: "book", similarity: r.similarity }));
+                    (chaptersRes.data || []).forEach((r: any) => all.push({ file_name: r.file_name, author: r.author, title: r.title, year: r.year, type: "chapter", similarity: r.similarity }));
+                    (editedRes.data || []).forEach((r: any) => all.push({ file_name: r.file_name, author: r.author, title: r.title, year: r.year, type: "edited_volume", similarity: r.similarity }));
+                    all.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
+                    library_candidates = all.slice(0, 20);
+                    if (library_candidates.length > 0) {
+                        library_candidates_block = "\n\nLIBRARY CANDIDATES (top semantic-search hits from the user's research library — for completeness, judge which are cited in the section, which are uncited-but-relevant, which are not relevant):\n\n" +
+                            library_candidates.map((c, i) => `${i + 1}. ${c.author} (${c.year}). "${c.title}" [file_name: ${c.file_name}, type: ${c.type}]`).join("\n");
+                    }
+                } catch (e) {
+                    library_candidates_block = "\n\n[library_search failed: " + _errStr(e) + "]";
+                }
+            }
+
+            const SYSTEM_PROMPT = `You audit one section of a scholarly philosophy essay for source engagement, running four audits in parallel. The section is given as numbered paragraphs ([¶1], [¶2], etc.). Citations follow Chicago author-date — (Author Year) or (Author Year, page). Treat any parenthetical of that shape as a citation.
+
+Output strict JSON only, no preamble:
+
+{
+  "missing_citations": [
+    {"n": int, "claim_snippet": string, "why_needs_citation": string, "recommended_source_type": string}
+  ],
+  "source_gaps": [
+    {"argument_move": string, "kind_of_source_missing": string, "candidate_authors_or_works": string[]}
+  ],
+  "completeness": {
+    "field_positions": [{"position": string, "represented_in_section": "yes" | "no" | "weak", "cited_via": string|null}],
+    "missing_positions": string[],
+    "assessment": string
+  },
+  "evidence_balance": [
+    {"n": int, "claim_snippet": string, "claim_strength": "strong" | "moderate" | "hedged", "evidence_strength": "strong" | "moderate" | "thin" | "absent", "mismatch_diagnosis": string, "suggested_fix": string}
+  ],
+  "library_candidates_assessment": [
+    {"file_name": string, "status": "cited" | "uncited_but_relevant" | "not_relevant", "reason": string}
+  ],
+  "summary_assessment": string
+}
+
+(1) missing_citations: a claim needs a citation when it attributes a view to a named source, reports an empirical or textual fact, or takes a position on a contested point. The author's own move does NOT need a citation. Be conservative — name only genuine gaps.
+
+(2) source_gaps: the section's argument relies on a TRADITION or KIND of source but cites nobody from it. Name the move, propose candidates.
+
+(3) completeness: list the major positions the section's argument ranges against. Mark each as represented / weakly represented / missing. "assessment" is one paragraph evaluating field coverage.
+
+(4) evidence_balance: judge each load-bearing claim's strength vs evidence provided. Imbalances: overreach (strong claim, thin evidence), under-confident (hedged claim, strong evidence), assertion (no evidence). Suggested_fix is one sentence to weaken or to add.
+
+(5) library_candidates_assessment: only populate if library candidates are provided below.
+
+summary_assessment: one paragraph (≤200 words) on the section's source-engagement integrity and the most leverage-bearing missing engagement.${library_candidates_block}`;
+
+            const msg = await anth.messages.create({
+                model: model || "claude-sonnet-4-6",
+                max_tokens: 5000,
+                system: SYSTEM_PROMPT,
+                messages: [{ role: "user", content: numbered }],
+            });
+            const text = msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+            const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+            const firstBrace = cleaned.indexOf("{");
+            const lastBrace = cleaned.lastIndexOf("}");
+            const jsonSpan = (firstBrace >= 0 && lastBrace > firstBrace) ? cleaned.slice(firstBrace, lastBrace + 1) : cleaned;
+            let parsed: any;
+            try { parsed = JSON.parse(jsonSpan); }
+            catch {
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: "Anthropic returned non-JSON. Raw head: " + text.slice(0, 400) }, null, 2) }],
+                };
+            }
+
+            let history_id: string | null = null;
+            if (project_slug) {
+                try {
+                    const ins = await supabase
+                        .from("drafts_source_audit_history")
+                        .insert({ project_slug, draft: draft.slice(0, 200_000), audit: parsed })
+                        .select("id")
+                        .single();
+                    if (!ins.error && ins.data) history_id = (ins.data as any).id;
+                } catch (_e) {}
+            }
+
+            const u = msg.usage;
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        success: true,
+                        paragraphs: rawParas.length,
+                        model_used: model || "claude-sonnet-4-6",
+                        tokens: { input: u.input_tokens, output: u.output_tokens },
+                        library_candidates_provided: library_candidates.length,
+                        ...parsed,
+                        history_id,
+                    }, null, 2),
+                }],
+            };
+        } catch (err) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: _errStr(err) }) }] };
+        }
+    },
+);
+
 // Companion tool: explicit lookup of past (rejected, chosen) pairs by similarity to a target draft.
 // Topic-sentence method (Rule 5) as its own tool — diagnose each paragraph's
 // opener and propose move-making rewrites. Diagnosis + Claude rewrites run in the
