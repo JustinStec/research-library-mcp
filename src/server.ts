@@ -2679,6 +2679,253 @@ Output strict JSON only, no preamble:
     },
 );
 
+// ============================================================================
+// drafts_referent_audit — paragraph-by-paragraph referent-clarity audit
+// ============================================================================
+server.tool(
+    "drafts_referent_audit",
+    "Paragraph-by-paragraph audit for vague or missing referents — the AI-tell where pronouns and demonstratives gesture at things never named, or anchor to multiple possible antecedents. Regex pre-pass (always runs) catches: bare_demonstrative_opener ('This shows that' with no noun), forward_pronoun_referent (pronoun pointing forward at a not-yet-introduced 'that' clause), pronoun_overload (≥6 'it' or ≥5 'they/them/their' in one paragraph), unanchored_definite ('the apparatus' / 'the position' / 'the structure' repeated as anaphor without prior specification), pronoun_chain_ambiguity (same pronoun across 3+ consecutive sentences). Deep mode (deep=true) calls Anthropic Haiku 4.5 per paragraph to resolve each pronoun and demonstrative against its actual referent in context and flag ambiguous or absent referents with a proposed noun substitution. ~$0.005/paragraph for deep mode. Use during revision when you suspect a paragraph's referents have drifted, or before submitting any paragraph in which the prior paragraph introduced new abstract terms (where forward-pronoun and bare-demonstrative failures cluster).",
+    {
+        draft: z.string().describe("The prose to audit (markdown or plain)."),
+        project_slug: z.string().optional().describe("Optional project slug for persistence to drafts_referent_history."),
+        deep: z.boolean().optional().default(false).describe("If true, run Anthropic referent resolution per paragraph. Requires ANTHROPIC_API_KEY."),
+        model: z.string().optional().default("claude-haiku-4-5-20251001").describe("Anthropic model for deep mode."),
+    },
+    async ({ draft, project_slug, deep, model }) => {
+        try {
+            const rawParas = draft.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+            const stripQuoted = (text: string): string =>
+                text
+                    .replace(/[“"']([^“”"']{0,4000}?)[”"']/g, (m) => " ".repeat(m.length))
+                    .replace(/‘([^‘’]{0,4000}?)’/g, (m) => " ".repeat(m.length));
+
+            const DEMONSTRATIVE_VERBS = [
+                "is", "are", "was", "were", "shows", "demonstrates", "reveals",
+                "illustrates", "proves", "entails", "means", "commits", "implies",
+                "follows", "holds", "requires", "leaves", "gives", "brings",
+                "raises", "opens", "closes", "reaches", "earns", "misses",
+                "makes", "puts", "becomes", "remains", "stays", "exists",
+            ];
+            const BARE_DEMONSTRATIVE_RE = new RegExp(
+                `(?:^|[.!?]\\s+)(This|That|These|Those)\\s+(?:${DEMONSTRATIVE_VERBS.join("|")})\\b`,
+                "g"
+            );
+            const FORWARD_PRONOUN_RES = [
+                /\b(it|this|that)\s*,\s+that\s+\w+(?:\s+\w+){0,3}\s+(?:could|would|might|will|should|may|can|is|are|was|were|has|have|do|does|did)\b/gi,
+                /\b(it|this|that)\b[^.!?]{0,40}[.!?]\s+(?:That|Which|Whether)\b/g,
+            ];
+            const UNANCHORED_DEFINITE_NOUNS = [
+                "position", "apparatus", "structure", "picture", "move",
+                "account", "framework", "field", "claim", "commitment",
+                "stance", "argument",
+            ];
+
+            type ParaAudit = {
+                n: number;
+                snippet: string;
+                word_count: number;
+                flags: string[];
+                notes: Record<string, string>;
+                referents?: Array<{
+                    word: string;
+                    sentence_idx: number;
+                    referent: string | null;
+                    ambiguity: "clear" | "ambiguous" | "absent";
+                    suggested_substitution: string | null;
+                }>;
+            };
+
+            const splitSentences = (p: string): string[] =>
+                p.split(/(?<=[.!?])\s+(?=[A-Z“"'])/).map(s => s.trim()).filter(Boolean);
+
+            const audited: ParaAudit[] = [];
+            for (let i = 0; i < rawParas.length; i++) {
+                const para = rawParas[i];
+                if (/^#{1,6}\s/.test(para) || /^-{3,}$/.test(para) || /^={3,}$/.test(para)) continue;
+                const wc = para.split(/\s+/).filter(Boolean).length;
+                if (wc < 40) continue;
+                const paraStripped = stripQuoted(para);
+                const flags: string[] = [];
+                const notes: Record<string, string> = {};
+
+                {
+                    const matches = [...paraStripped.matchAll(BARE_DEMONSTRATIVE_RE)];
+                    if (matches.length > 0) {
+                        flags.push("bare_demonstrative_opener");
+                        notes["bare_demonstrative_opener"] = matches.slice(0, 3).map(m => `"${m[0].trim()}"`).join("; ") + " — demonstrative subject with no noun. Replace with the specific noun the demonstrative refers to.";
+                    }
+                }
+                {
+                    for (const re of FORWARD_PRONOUN_RES) {
+                        const m = paraStripped.match(re);
+                        if (m && m.length > 0) {
+                            flags.push("forward_pronoun_referent");
+                            notes["forward_pronoun_referent"] = `"${m[0].trim().slice(0, 100)}" — the pronoun appears before the "that/which" clause that introduces what it refers to. Recast to name the referent first, or fold the clause back into the prior sentence.`;
+                            break;
+                        }
+                    }
+                }
+                {
+                    const itCount = (paraStripped.match(/\bit\b/gi) || []).length;
+                    const theyCount = (paraStripped.match(/\b(they|them|their)\b/gi) || []).length;
+                    if (wc >= 80 && itCount >= 6) {
+                        flags.push("pronoun_overload");
+                        notes["pronoun_overload"] = `paragraph has ${itCount} instances of "it" across ${wc} words. When a paragraph leans on a single pronoun this heavily, the referents almost certainly drift. Anchor by name in places where the antecedent has changed.`;
+                    }
+                    if (wc >= 80 && theyCount >= 5) {
+                        flags.push("pronoun_overload");
+                        notes["pronoun_overload_they"] = `paragraph has ${theyCount} instances of "they/them/their" across ${wc} words.`;
+                    }
+                }
+                {
+                    const hits: Array<{ noun: string; count: number }> = [];
+                    for (const noun of UNANCHORED_DEFINITE_NOUNS) {
+                        const re = new RegExp(`\\bthe\\s+${noun}\\b`, "gi");
+                        const c = (paraStripped.match(re) || []).length;
+                        if (c >= 3) hits.push({ noun, count: c });
+                    }
+                    if (hits.length > 0) {
+                        flags.push("unanchored_definite");
+                        notes["unanchored_definite"] = hits.map(h => `"the ${h.noun}" ×${h.count}`).join(", ") + ` — a definite noun phrase repeated as anaphor without prior specification reads as a totem. Each repetition should specify something new about the noun.`;
+                    }
+                }
+                {
+                    const sents = splitSentences(paraStripped);
+                    let chain = 0;
+                    let maxChain = 0;
+                    for (const s of sents) {
+                        const hasIt = /\bit\b/i.test(s);
+                        const hasProperNoun = / [A-Z][a-z]+/.test(" " + s.slice(1));
+                        if (hasIt && !hasProperNoun) {
+                            chain += 1;
+                            if (chain > maxChain) maxChain = chain;
+                        } else {
+                            chain = 0;
+                        }
+                    }
+                    if (maxChain >= 3) {
+                        flags.push("pronoun_chain_ambiguity");
+                        notes["pronoun_chain_ambiguity"] = `"it" carried across ${maxChain} consecutive sentences with no proper-noun anchor in between. Rename the referent in at least one of them.`;
+                    }
+                }
+
+                audited.push({
+                    n: i + 1,
+                    snippet: para.slice(0, 200),
+                    word_count: wc,
+                    flags,
+                    notes,
+                });
+            }
+
+            let deep_called = 0;
+            if (deep) {
+                const anth = getAnthropic();
+                if (!anth) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({ error: "deep=true requires ANTHROPIC_API_KEY in the MCP server's env. Shallow mode works without the key." }, null, 2),
+                        }],
+                    };
+                }
+                const SYSTEM_PROMPT = `You audit one paragraph from a scholarly philosophy essay for referent clarity. Identify every pronoun (it, they, them, their) and every bare demonstrative (this, that, these, those used as subject without a noun) in the paragraph. For each, determine what it refers to using ONLY the prose given (no outside context). Output strict JSON only, no preamble:
+
+{"referents": [{"word": string, "sentence_idx": int, "referent": string|null, "ambiguity": "clear"|"ambiguous"|"absent", "suggested_substitution": string|null}]}
+
+- "referent" is the noun or phrase the pronoun/demonstrative refers to, quoted from the paragraph if present.
+- "ambiguity": "clear" if exactly one referent is available; "ambiguous" if multiple candidate referents exist; "absent" if no referent is on the page at all (the pronoun points at nothing).
+- "suggested_substitution" is the specific noun phrase to replace the pronoun with, in the prose's own vocabulary. null when ambiguity is "clear".
+- sentence_idx is 0-based within the paragraph.`;
+                for (const pa of audited) {
+                    if (pa.flags.length === 0) continue;
+                    try {
+                        const msg = await anth.messages.create({
+                            model: model || "claude-haiku-4-5-20251001",
+                            max_tokens: 1000,
+                            system: SYSTEM_PROMPT,
+                            messages: [{ role: "user", content: rawParas[pa.n - 1] }],
+                        });
+                        deep_called += 1;
+                        const text = msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+                        const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+                        const firstBrace = cleaned.indexOf("{");
+                        const lastBrace = cleaned.lastIndexOf("}");
+                        const jsonSpan = (firstBrace >= 0 && lastBrace > firstBrace) ? cleaned.slice(firstBrace, lastBrace + 1) : cleaned;
+                        let parsed: any;
+                        try { parsed = JSON.parse(jsonSpan); }
+                        catch {
+                            pa.notes["_deep_parse_error"] = "Anthropic returned non-JSON; referent resolution skipped. Raw head: " + text.slice(0, 160);
+                            continue;
+                        }
+                        if (Array.isArray(parsed.referents)) {
+                            pa.referents = parsed.referents;
+                            const absent = parsed.referents.filter((r: any) => r.ambiguity === "absent").length;
+                            const ambiguous = parsed.referents.filter((r: any) => r.ambiguity === "ambiguous").length;
+                            if (absent > 0 && !pa.flags.includes("deep_absent_referent")) {
+                                pa.flags.push("deep_absent_referent");
+                                pa.notes["deep_absent_referent"] = `${absent} pronoun(s)/demonstrative(s) with NO referent on the page.`;
+                            }
+                            if (ambiguous > 0 && !pa.flags.includes("deep_ambiguous_referent")) {
+                                pa.flags.push("deep_ambiguous_referent");
+                                pa.notes["deep_ambiguous_referent"] = `${ambiguous} pronoun(s)/demonstrative(s) with multiple candidate referents.`;
+                            }
+                        }
+                    } catch (err) {
+                        pa.notes["_deep_call_error"] = _errStr(err);
+                    }
+                }
+            }
+
+            const flag_counts: Record<string, number> = {};
+            let paragraphs_with_referent_failure = 0;
+            for (const pa of audited) {
+                let has_failure = false;
+                for (const f of pa.flags) {
+                    flag_counts[f] = (flag_counts[f] || 0) + 1;
+                    has_failure = true;
+                }
+                if (has_failure) paragraphs_with_referent_failure += 1;
+            }
+
+            let history_id: string | null = null;
+            if (project_slug) {
+                try {
+                    const ins = await supabase
+                        .from("drafts_referent_history")
+                        .insert({
+                            project_slug,
+                            draft: draft.slice(0, 200_000),
+                            audit: { paragraphs: audited, summary: { flag_counts, paragraphs_with_referent_failure, deep_called } },
+                        })
+                        .select("id")
+                        .single();
+                    if (!ins.error && ins.data) history_id = (ins.data as any).id;
+                } catch (_e) {}
+            }
+
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        success: true,
+                        paragraphs: rawParas.length,
+                        paragraphs_audited: audited,
+                        summary: {
+                            flag_counts,
+                            paragraphs_with_referent_failure,
+                            deep_mode_paragraphs_called: deep_called,
+                        },
+                        history_id,
+                    }, null, 2),
+                }],
+            };
+        } catch (err) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: _errStr(err) }) }] };
+        }
+    },
+);
+
 // Companion tool: explicit lookup of past (rejected, chosen) pairs by similarity to a target draft.
 // Topic-sentence method (Rule 5) as its own tool — diagnose each paragraph's
 // opener and propose move-making rewrites. Diagnosis + Claude rewrites run in the
