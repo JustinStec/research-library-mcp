@@ -2926,6 +2926,133 @@ server.tool(
     },
 );
 
+// ============================================================================
+// drafts_argument_arc_audit — section-level argument audit
+// ============================================================================
+server.tool(
+    "drafts_argument_arc_audit",
+    "Section-level argument-arc audit. Where drafts_toulmin_audit audits each paragraph in isolation, this audits a section as a single argumentative move. One Anthropic call (Sonnet 4.6 by default) holds the whole section in context and identifies: section-level claim and warrant, the inter-paragraph chain (each paragraph's claim and role in the arc), chain gaps (where N+1 does not follow from N), redundancies (paragraphs making the same claim), stasis drift (whether the section stays at one stasis or shifts without naming the shift). Returns a section_assessment paragraph at the end summarizing the section's argumentative integrity. ~$0.04 per call; use at the end of composing a section, before submitting for revision, or when paragraph-level audits show clean individual paragraphs but the section still feels disjointed. Requires ANTHROPIC_API_KEY.",
+    {
+        draft: z.string().describe("The section prose to audit. Paragraphs split on blank lines."),
+        project_slug: z.string().optional().describe("Optional project slug for persistence to drafts_argument_arc_history."),
+        model: z.string().optional().default("claude-sonnet-4-6").describe("Anthropic model. Default Sonnet 4.6; pass claude-opus-4-8 for the highest reasoning depth, or claude-haiku-4-5-20251001 for cheap audits."),
+    },
+    async ({ draft, project_slug, model }) => {
+        try {
+            const anth = getAnthropic();
+            if (!anth) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({ error: "drafts_argument_arc_audit requires ANTHROPIC_API_KEY in the MCP server's env." }, null, 2),
+                    }],
+                };
+            }
+            const rawParas = draft.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+            const numbered = rawParas.map((p, i) => `[¶${i + 1}]\n${p}`).join("\n\n");
+
+            const SYSTEM_PROMPT = `You audit one section of a scholarly philosophy essay as a single argumentative move. The section is given as numbered paragraphs ([¶1], [¶2], etc.). Your job is to identify the section's argumentative arc, name the section-level Toulmin elements, trace the chain across paragraphs, and surface where the chain breaks or doubles back.
+
+Output strict JSON, no preamble:
+
+{
+  "section_claim": string,
+  "section_warrant": string|null,
+  "section_warrant_failure": null|"missing"|"implicit_only"|"meta_narrated"|"tautological"|"priority_based",
+  "suggested_section_warrant": string|null,
+  "paragraph_chain": [
+    {
+      "n": int,
+      "claim": string,
+      "role_in_arc": "ground" | "warrant-installation" | "claim-statement" | "objection" | "reply" | "case" | "transition" | "redundant",
+      "picks_up_from_prior": "yes" | "no" | "weak",
+      "sets_up_for_next": "yes" | "no" | "weak"
+    }
+  ],
+  "chain_gaps": [
+    {
+      "after_para": int,
+      "before_para": int,
+      "description": string,
+      "suggested_bridge": string|null
+    }
+  ],
+  "redundancies": [
+    {
+      "paragraphs": int[],
+      "shared_claim": string,
+      "which_to_keep": int,
+      "reason": string
+    }
+  ],
+  "stasis_drift": {
+    "primary_stasis": "fact" | "definition" | "quality" | "jurisdiction" | "mixed",
+    "per_paragraph_stasis": [{"n": int, "stasis": string}],
+    "drift_description": string|null
+  },
+  "section_assessment": string
+}
+
+Notes for the audit:
+- section_claim: the proposition the whole section asks the reader to accept (one sentence).
+- section_warrant: the inferential principle that licenses the section's move from its grounds to its claim. Often implicit at section scale — if you cannot find it in the prose, set to null and set section_warrant_failure to "implicit_only" or "missing" as appropriate.
+- role_in_arc: each paragraph plays one role. "Ground" provides material the section's later argument rests on. "Warrant-installation" sets up the inferential principle. "Claim-statement" stakes a sub-claim. "Objection" raises a counter. "Reply" answers it. "Case" applies the apparatus. "Transition" handles a stasis shift. "Redundant" repeats a claim already made.
+- chain_gaps: only fill if the inferential link between consecutive paragraphs is genuinely broken — not for stylistic shifts. The suggested_bridge is a one-sentence proposal to make the link explicit.
+- redundancies: two paragraphs making the same claim, even with different sources, count. Name which to keep and why.
+- stasis_drift uses Aristotelian stasis theory: fact (did/does it exist?), definition (what counts as X?), quality (is X good/right?), jurisdiction (who decides / by what procedure?). A clean section stays at one stasis OR names the stasis shift explicitly when it happens.
+- section_assessment: one paragraph of plain prose (≤200 words) summarizing the section's argumentative integrity, what works, what breaks, and the single most leverage-bearing change.`;
+
+            const msg = await anth.messages.create({
+                model: model || "claude-sonnet-4-6",
+                max_tokens: 4000,
+                system: SYSTEM_PROMPT,
+                messages: [{ role: "user", content: numbered }],
+            });
+            const text = msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+            const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+            const firstBrace = cleaned.indexOf("{");
+            const lastBrace = cleaned.lastIndexOf("}");
+            const jsonSpan = (firstBrace >= 0 && lastBrace > firstBrace) ? cleaned.slice(firstBrace, lastBrace + 1) : cleaned;
+            let parsed: any;
+            try { parsed = JSON.parse(jsonSpan); }
+            catch {
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: "Anthropic returned non-JSON. Raw head: " + text.slice(0, 400) }, null, 2) }],
+                };
+            }
+
+            let history_id: string | null = null;
+            if (project_slug) {
+                try {
+                    const ins = await supabase
+                        .from("drafts_argument_arc_history")
+                        .insert({ project_slug, draft: draft.slice(0, 200_000), audit: parsed })
+                        .select("id")
+                        .single();
+                    if (!ins.error && ins.data) history_id = (ins.data as any).id;
+                } catch (_e) {}
+            }
+
+            const u = msg.usage;
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        success: true,
+                        paragraphs: rawParas.length,
+                        model_used: model || "claude-sonnet-4-6",
+                        tokens: { input: u.input_tokens, output: u.output_tokens },
+                        ...parsed,
+                        history_id,
+                    }, null, 2),
+                }],
+            };
+        } catch (err) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: _errStr(err) }) }] };
+        }
+    },
+);
+
 // Companion tool: explicit lookup of past (rejected, chosen) pairs by similarity to a target draft.
 // Topic-sentence method (Rule 5) as its own tool — diagnose each paragraph's
 // opener and propose move-making rewrites. Diagnosis + Claude rewrites run in the
