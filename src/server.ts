@@ -3145,7 +3145,7 @@ summary_assessment: one paragraph (≤200 words) on the section's source-engagem
 
             const msg = await anth.messages.create({
                 model: model || "claude-sonnet-4-6",
-                max_tokens: 5000,
+                max_tokens: 10000,
                 system: SYSTEM_PROMPT,
                 messages: [{ role: "user", content: numbered }],
             });
@@ -3158,7 +3158,7 @@ summary_assessment: one paragraph (≤200 words) on the section's source-engagem
             try { parsed = JSON.parse(jsonSpan); }
             catch {
                 return {
-                    content: [{ type: "text", text: JSON.stringify({ error: "Anthropic returned non-JSON. Raw head: " + text.slice(0, 400) }, null, 2) }],
+                    content: [{ type: "text", text: JSON.stringify({ error: "Anthropic returned non-JSON (likely truncated at max_tokens). Stop reason: " + (msg.stop_reason || "?") + ". Raw head: " + text.slice(0, 400) + " ... Raw tail: " + text.slice(-200) }, null, 2) }],
                 };
             }
 
