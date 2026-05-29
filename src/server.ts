@@ -2592,11 +2592,19 @@ Output strict JSON only, no preamble:
                             .filter((b: any) => b.type === "text")
                             .map((b: any) => b.text)
                             .join("");
+                        // Robust JSON extraction: strip markdown fences, then
+                        // grab the span from first `{` to last `}` (handles
+                        // models that prefix or suffix the JSON with prose).
                         const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+                        const firstBrace = cleaned.indexOf("{");
+                        const lastBrace = cleaned.lastIndexOf("}");
+                        const jsonSpan = (firstBrace >= 0 && lastBrace > firstBrace)
+                            ? cleaned.slice(firstBrace, lastBrace + 1)
+                            : cleaned;
                         let parsed: any;
-                        try { parsed = JSON.parse(cleaned); }
+                        try { parsed = JSON.parse(jsonSpan); }
                         catch {
-                            pa.notes["_deep_parse_error"] = "Anthropic returned non-JSON; element decomposition skipped for this paragraph.";
+                            pa.notes["_deep_parse_error"] = "Anthropic returned non-JSON; element decomposition skipped for this paragraph. Raw head: " + text.slice(0, 160);
                             continue;
                         }
                         pa.elements = {
