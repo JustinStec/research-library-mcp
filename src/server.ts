@@ -397,66 +397,86 @@ function getTypeSpecificMeta(table, row) {
     }
 }
 // Tool 9: Search library full-text
-server.tool("library_search", "Full-text search across all academic library texts (journal articles, books, edited volumes, book chapters). Returns ranked results by relevance.", {
-    query: z.string().describe("Search query (e.g., 'embodied cognition' or 'dissociation of sensibility')"),
+// Search the academic library across author, title, AND content. Earlier this
+// only ran Postgres FTS on the content column, which silently excluded the
+// primary works under their own author's name — a query for "Husserl"
+// returned scholars-about-Husserl but not Husserl's own books, because the
+// books' content doesn't contain his name. Now merges three predicates per
+// table (author ilike / title ilike / content FTS) with primacy boosts so
+// the author's own works rank above secondary literature.
+server.tool("library_search", "Search the academic library across author, title, AND content. Best for single-name queries (e.g. 'Husserl') and short topic phrases (e.g. 'dissociation of sensibility'). Returns the named author's own works ranked above secondary literature that mentions them. For purely conceptual queries with no name attached, prefer library_semantic_search.", {
+    query: z.string().describe("Search query — an author name, a title fragment, or a short topic phrase."),
     category: z.string().optional().describe("Optional: limit to category (Cognitive, Eliot, Philosophy, etc.)"),
     max_results: z.number().optional().describe("Max results (default 30)"),
 }, async ({ query, category, max_results = 30 }) => {
     try {
-        const allResults: any[] = [];
+        const allResults: Record<string, any> = {};
+        const pat = `%${query.replace(/[%_]/g, "\\$&")}%`;
         for (const table of LIBRARY_TABLES) {
-            let q = supabase
-                .from(table)
-                .select("file_name, author, title, year, category, subcategory, word_count" +
+            const cols = "file_name, author, title, year, category, subcategory, word_count" +
                 (table === "journal_articles" ? ", journal, volume, issue, pages" : "") +
                 (table === "books" || table === "edited_volumes" ? ", publisher, editors" : "") +
-                (table === "book_chapters" ? ", book_title, editors, publisher, pages" : ""))
-                .textSearch("content", query, { type: "websearch" })
-                .limit(max_results);
-            if (category)
-                q = q.eq("category", category);
-            const { data, error } = await q;
-            if (error)
-                throw error;
-            (data || [] as any[]).forEach((r: any) => {
-                allResults.push({
-                    file_name: r.file_name,
-                    author: r.author,
-                    title: r.title,
-                    year: r.year,
-                    category: r.category,
-                    subcategory: r.subcategory,
-                    word_count: r.word_count,
-                    _type: getTextType(table),
-                    ...getTypeSpecificMeta(table, r),
-                });
-            });
+                (table === "book_chapters" ? ", book_title, editors, publisher, pages" : "");
+            const addRows = (rows: any[], hitSource: "author"|"title"|"content") => {
+                for (const r of rows || []) {
+                    const key = `${table}:${r.file_name}`;
+                    const existing = allResults[key];
+                    if (existing) { existing._hits.add(hitSource); continue; }
+                    allResults[key] = {
+                        file_name: r.file_name,
+                        author: r.author,
+                        title: r.title,
+                        year: r.year,
+                        category: r.category,
+                        subcategory: r.subcategory,
+                        word_count: r.word_count,
+                        _type: getTextType(table),
+                        ...getTypeSpecificMeta(table, r),
+                        _hits: new Set([hitSource]),
+                    };
+                }
+            };
+            let qA = supabase.from(table).select(cols).ilike("author", pat).limit(max_results);
+            if (category) qA = qA.eq("category", category);
+            const a = await qA;
+            if (a.error) throw a.error;
+            addRows(a.data as any[], "author");
+            let qT = supabase.from(table).select(cols).ilike("title", pat).limit(max_results);
+            if (category) qT = qT.eq("category", category);
+            const t = await qT;
+            if (t.error) throw t.error;
+            addRows(t.data as any[], "title");
+            let qC = supabase.from(table).select(cols).textSearch("content", query, { type: "websearch" }).limit(max_results);
+            if (category) qC = qC.eq("category", category);
+            const c = await qC;
+            if (c.error) throw c.error;
+            addRows(c.data as any[], "content");
         }
-        // Score by title-match relevance: terms appearing in the title get +10 each.
-        // Prefer shorter (more focused) texts as a tiebreaker.
-        // Better than word_count DESC; a true ts_rank would require a custom RPC.
         const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-        function relevance(item) {
-            const title = (item.title || "").toLowerCase();
+        function relevance(item: any) {
             let score = 0;
+            if (item._hits.has("author")) score += 100;
+            if (item._hits.has("title")) score += 50;
+            if (item._hits.has("content")) score += 5;
+            const title = (item.title || "").toLowerCase();
             for (const term of queryTerms) {
-                if (title.includes(term))
-                    score += 10;
+                if (title.includes(term)) score += 10;
             }
             score -= Math.log((item.word_count || 100000)) * 0.1;
             return score;
         }
-        allResults.sort((a, b) => relevance(b) - relevance(a));
-        const limited = allResults.slice(0, max_results);
+        const merged = Object.values(allResults);
+        merged.sort((a: any, b: any) => relevance(b) - relevance(a));
+        const limited = merged.slice(0, max_results).map((r: any) => {
+            const out = { ...r, _matched: [...r._hits] };
+            delete out._hits;
+            return out;
+        });
         return {
             content: [{
-                    type: "text",
-                    text: JSON.stringify({
-                        success: true,
-                        count: limited.length,
-                        results: limited
-                    }, null, 2),
-                }],
+                type: "text",
+                text: JSON.stringify({ success: true, count: limited.length, results: limited }, null, 2),
+            }],
         };
     }
     catch (err) {
