@@ -3004,7 +3004,7 @@ Notes for the audit:
 
             const msg = await anth.messages.create({
                 model: model || "claude-sonnet-4-6",
-                max_tokens: 4000,
+                max_tokens: 10000,
                 system: SYSTEM_PROMPT,
                 messages: [{ role: "user", content: numbered }],
             });
@@ -3017,7 +3017,7 @@ Notes for the audit:
             try { parsed = JSON.parse(jsonSpan); }
             catch {
                 return {
-                    content: [{ type: "text", text: JSON.stringify({ error: "Anthropic returned non-JSON. Raw head: " + text.slice(0, 400) }, null, 2) }],
+                    content: [{ type: "text", text: JSON.stringify({ error: "Anthropic returned non-JSON (likely truncated at max_tokens). Stop reason: " + (msg.stop_reason || "?") + ". Raw head: " + text.slice(0, 400) + " ... Raw tail: " + text.slice(-200) }, null, 2) }],
                 };
             }
 
