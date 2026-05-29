@@ -3195,6 +3195,169 @@ summary_assessment: one paragraph (≤200 words) on the section's source-engagem
     },
 );
 
+// ============================================================================
+// drafts_article_structure_audit — whole-article structural audit
+// ============================================================================
+server.tool(
+    "drafts_article_structure_audit",
+    "Whole-article STRUCTURAL audit. Holds the entire article in context and judges only structure: are the current section breaks in the right places, should sections be merged or split, are paragraphs in the right sequence within and across sections, are there cross-section redundancies. Returns a proposed table of contents and the single highest-leverage structural change. One Sonnet 4.6 call (~$0.15–0.30, ~90s); pass model='claude-opus-4-8' for the deepest reasoning (~$0.75, ~180s). Use after the first complete draft (to discover the real structure the prose has arrived at) and before submission (to verify the final structure earned its breaks). Distinct from drafts_argument_arc_audit (section scope; checks paragraph chain within a section) and drafts_toulmin_audit (paragraph scope). Requires ANTHROPIC_API_KEY. Section headers are auto-detected from lines matching Roman numerals (I, II, III, IV, V) or 'Section X' headers; pass section_pattern to override.",
+    {
+        draft: z.string().describe("The whole article (markdown or plain). Section headers should be on their own lines."),
+        project_slug: z.string().optional().describe("Optional project slug for persistence to drafts_article_structure_history."),
+        section_pattern: z.string().optional().describe("Optional regex (string form) for section headers. Default matches Roman numerals on their own line and 'Section X' headers."),
+        model: z.string().optional().default("claude-sonnet-4-6").describe("Anthropic model. Default Sonnet 4.6; pass claude-opus-4-8 for the deepest reasoning."),
+    },
+    async ({ draft, project_slug, section_pattern, model }) => {
+        try {
+            const anth = getAnthropic();
+            if (!anth) {
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: "drafts_article_structure_audit requires ANTHROPIC_API_KEY in the MCP server's env." }, null, 2) }],
+                };
+            }
+            const rawParas = draft.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+
+            const sectionRe = section_pattern
+                ? new RegExp(section_pattern)
+                : /^#{0,4}\s*(?:Section\s+)?([IVXLCDM]+)\.?\s*$/i;
+            const sectionMarkers: Array<{ paraIndex: number; label: string }> = [];
+            for (let i = 0; i < rawParas.length; i++) {
+                const m = rawParas[i].match(sectionRe);
+                if (m && rawParas[i].length < 40) {
+                    sectionMarkers.push({ paraIndex: i, label: m[1] || rawParas[i].trim() });
+                }
+            }
+
+            type Section = { label: string; firstPara: number; lastPara: number; paragraphs: number[] };
+            const sections: Section[] = [];
+            if (sectionMarkers.length === 0) {
+                sections.push({ label: "(no headers detected)", firstPara: 0, lastPara: rawParas.length - 1, paragraphs: rawParas.map((_, i) => i + 1) });
+            } else {
+                if (sectionMarkers[0].paraIndex > 0) {
+                    sections.push({
+                        label: "(preamble)",
+                        firstPara: 0,
+                        lastPara: sectionMarkers[0].paraIndex - 1,
+                        paragraphs: Array.from({ length: sectionMarkers[0].paraIndex }, (_, k) => k + 1),
+                    });
+                }
+                for (let m = 0; m < sectionMarkers.length; m++) {
+                    const start = sectionMarkers[m].paraIndex + 1;
+                    const end = (m + 1 < sectionMarkers.length) ? sectionMarkers[m + 1].paraIndex - 1 : rawParas.length - 1;
+                    if (end >= start) {
+                        sections.push({
+                            label: sectionMarkers[m].label,
+                            firstPara: start,
+                            lastPara: end,
+                            paragraphs: Array.from({ length: end - start + 1 }, (_, k) => start + k + 1),
+                        });
+                    }
+                }
+            }
+
+            const lines: string[] = [];
+            let globalN = 0;
+            for (let i = 0; i < rawParas.length; i++) {
+                const isHeader = sectionMarkers.some(s => s.paraIndex === i);
+                if (isHeader) {
+                    lines.push(`\n=== SECTION ${rawParas[i]} ===\n`);
+                } else {
+                    globalN += 1;
+                    lines.push(`[¶${globalN}]\n${rawParas[i]}`);
+                }
+            }
+            const numbered = lines.join("\n\n");
+
+            const sectionsSummary = sections
+                .map(s => `§${s.label}: paragraphs ¶${s.paragraphs[0]}–¶${s.paragraphs[s.paragraphs.length - 1]} (${s.paragraphs.length} paragraphs)`)
+                .join("\n");
+
+            const SYSTEM_PROMPT = `You audit the STRUCTURE of a scholarly philosophy article. Your job is NOT to evaluate the content of the prose — it is to judge whether the current section breaks are in the right places, whether sections should be merged or split, whether paragraphs are in the right sequence within and across sections, and whether the article has cross-section redundancies.
+
+The article is given as numbered paragraphs ([¶1], [¶2], …) interleaved with the current section headers (=== SECTION X ===). Paragraph numbers run continuously across the whole article — section headers do NOT consume a paragraph number.
+
+CURRENT SECTION BOUNDARIES:
+${sectionsSummary}
+
+Output strict JSON only, no preamble:
+
+{
+  "current_sections": [
+    {"label": string, "first_paragraph": int, "last_paragraph": int, "n_paragraphs": int, "internal_coherence": "tight" | "loose" | "fragmented", "primary_argumentative_role": string, "one_sentence_summary": string}
+  ],
+  "section_break_critique": [
+    {"current_break_between_sections": [string, string], "currently_at_paragraph": int, "verdict": "well_placed" | "should_move_earlier" | "should_move_later" | "should_be_removed", "suggested_at_paragraph": int | null, "reasoning": string}
+  ],
+  "missing_section_breaks": [
+    {"currently_in_section": string, "suggested_break_at_paragraph": int, "rationale": string, "proposed_role_of_new_section": string}
+  ],
+  "paragraph_reorder_suggestions": [
+    {"paragraph_n": int, "paragraph_snippet": string, "currently_in_section": string, "suggested_new_position": string, "scope": "within_section" | "cross_section", "reasoning": string, "confidence": "high" | "medium" | "low"}
+  ],
+  "cross_section_redundancies": [
+    {"paragraphs": int[], "shared_argument": string, "recommendation": "merge" | "delete_one_keep_other" | "differentiate"}
+  ],
+  "proposed_table_of_contents": [
+    {"section": string, "argumentative_role": string, "paragraphs": int[], "what_changed_from_current": string}
+  ],
+  "highest_leverage_change": string,
+  "structural_assessment": string
+}
+
+Be conservative with reorderings — only flag changes that genuinely improve the arc. The prose's order encodes the author's judgments about transitions; do not propose reorderings for stylistic reasons. Reorder only when the current position is harming the argument. Use "paragraph_snippet" (≤120 chars) so the user can locate the paragraph quickly. structural_assessment is one paragraph (≤200 words).`;
+
+            const msg = await anth.messages.create({
+                model: model || "claude-sonnet-4-6",
+                max_tokens: 15000,
+                system: SYSTEM_PROMPT,
+                messages: [{ role: "user", content: numbered }],
+            });
+            const text = msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+            const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+            const firstBrace = cleaned.indexOf("{");
+            const lastBrace = cleaned.lastIndexOf("}");
+            const jsonSpan = (firstBrace >= 0 && lastBrace > firstBrace) ? cleaned.slice(firstBrace, lastBrace + 1) : cleaned;
+            let parsed: any;
+            try { parsed = JSON.parse(jsonSpan); }
+            catch {
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: "Anthropic returned non-JSON (likely truncated at max_tokens). Stop reason: " + (msg.stop_reason || "?") + ". Raw head: " + text.slice(0, 400) + " ... Raw tail: " + text.slice(-200) }, null, 2) }],
+                };
+            }
+
+            let history_id: string | null = null;
+            if (project_slug) {
+                try {
+                    const ins = await supabase
+                        .from("drafts_article_structure_history")
+                        .insert({ project_slug, draft: draft.slice(0, 400_000), audit: parsed })
+                        .select("id")
+                        .single();
+                    if (!ins.error && ins.data) history_id = (ins.data as any).id;
+                } catch (_e) {}
+            }
+
+            const u = msg.usage;
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        success: true,
+                        total_paragraphs: globalN,
+                        sections_detected: sections.length,
+                        model_used: model || "claude-sonnet-4-6",
+                        tokens: { input: u.input_tokens, output: u.output_tokens },
+                        ...parsed,
+                        history_id,
+                    }, null, 2),
+                }],
+            };
+        } catch (err) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: _errStr(err) }) }] };
+        }
+    },
+);
+
 // Companion tool: explicit lookup of past (rejected, chosen) pairs by similarity to a target draft.
 // Topic-sentence method (Rule 5) as its own tool — diagnose each paragraph's
 // opener and propose move-making rewrites. Diagnosis + Claude rewrites run in the
