@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 // Supabase configuration
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -17,6 +18,16 @@ function getOpenAI(): OpenAI {
         _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     }
     return _openai;
+}
+// Anthropic API (used by drafts_toulmin_audit's deep mode for Toulmin element
+// decomposition). Key absence is OK in shallow mode; deep mode returns a
+// friendly error when undefined.
+let _anthropic: Anthropic | null = null;
+function getAnthropic(): Anthropic | null {
+    if (_anthropic) return _anthropic;
+    if (!process.env.ANTHROPIC_API_KEY) return null;
+    _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    return _anthropic;
 }
 async function getQueryEmbedding(text) {
     const res = await getOpenAI().embeddings.create({
@@ -2443,6 +2454,223 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
             }],
     };
 });
+
+// ============================================================================
+// drafts_toulmin_audit — paragraph-by-paragraph Toulmin warrant audit
+// ============================================================================
+server.tool(
+    "drafts_toulmin_audit",
+    "Paragraph-by-paragraph Toulmin warrant audit. Decomposes each paragraph into Toulmin's six elements (claim, grounds, warrant, backing, qualifier, rebuttal) and flags warrant failures. Regex pre-pass (always runs) catches: meta_narrated_warrant ('X explains why', 'it follows that'), priority_warrant ('before any LLM', 'had already anticipated'), missing_inferential_clause (≥80-word paragraph with no since/because/which/if/etc.), tautological_warrant_proximity (predicate restates subject). Deep mode (deep=true) calls Anthropic Haiku 4.5 per paragraph to identify each Toulmin element by content and propose a one-sentence warrant in inferential-clause shape when one is missing. Deep mode requires ANTHROPIC_API_KEY in the MCP env; cost ~$0.005/paragraph. Use before submitting any composed paragraph to a revision-heavy session — turns warrant-failure into a tool catch rather than a Justin catch.",
+    {
+        draft: z.string().describe("The prose to audit (markdown or plain). Paragraphs split on blank lines."),
+        project_slug: z.string().optional().describe("Optional project slug for persistence to drafts_toulmin_history."),
+        deep: z.boolean().optional().default(false).describe("If true, run a per-paragraph Anthropic call for full Toulmin decomposition + suggested warrant. Requires ANTHROPIC_API_KEY."),
+        model: z.string().optional().default("claude-haiku-4-5-20251001").describe("Anthropic model for deep mode (default Haiku 4.5)."),
+    },
+    async ({ draft, project_slug, deep, model }) => {
+        try {
+            const rawParas = draft.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+            const stripQuoted = (text: string): string =>
+                text
+                    .replace(/[“"']([^“”"']{0,4000}?)[”"']/g, (m) => " ".repeat(m.length))
+                    .replace(/‘([^‘’]{0,4000}?)’/g, (m) => " ".repeat(m.length));
+
+            const META_NARRATED_PATTERNS = [
+                /\b(?:this|that|it|which)\s+(?:shows|demonstrates|reveals|illustrates|proves|entails|means)\s+(?:why|that|how)\b/i,
+                /\bit\s+follows\s+that\b/i,
+                /\b[A-Z][a-z]+(?:'s|’s)?\s+analysis\s+(?:explains|shows|demonstrates|reveals)\s+(?:why|that)\b/,
+                /\b(?:therefore|thereby|hence)\b/i,
+            ];
+            const PRIORITY_PATTERNS = [
+                /\bbefore\s+any\s+\w+\s+(?:could|would|might)\b/i,
+                /\bin\s+\d{4}(?:[–-]\d{4})?,?\s+before\b/i,
+                /\bhad\s+already\s+\w+(?:ed|n)\b/i,
+                /\banticipated\b/i,
+                /\bavant\s+la\s+lettre\b/i,
+            ];
+            const INFERENTIAL_CONNECTIVE = /\b(?:since|because|which|if|unless|where|when|once|so\s+that|given\s+that|in\s+so\s+far\s+as|insofar\s+as)\b/i;
+
+            type ToulminElements = {
+                claim: string | null;
+                grounds: string | null;
+                warrant: string | null;
+                backing: string | null;
+                qualifier: string | null;
+                rebuttal: string | null;
+            };
+            type ParaAudit = {
+                n: number;
+                snippet: string;
+                word_count: number;
+                flags: string[];
+                notes: Record<string, string>;
+                elements?: ToulminElements;
+                suggested_warrant?: string | null;
+                warrant_failure?: string | null;
+            };
+
+            const audited: ParaAudit[] = [];
+            for (let i = 0; i < rawParas.length; i++) {
+                const para = rawParas[i];
+                if (/^#{1,6}\s/.test(para) || /^-{3,}$/.test(para) || /^={3,}$/.test(para)) continue;
+                const wc = para.split(/\s+/).filter(Boolean).length;
+                if (wc < 40) continue;
+                const paraStripped = stripQuoted(para);
+                const flags: string[] = [];
+                const notes: Record<string, string> = {};
+
+                for (const re of META_NARRATED_PATTERNS) {
+                    const m = paraStripped.match(re);
+                    if (m) {
+                        if (!flags.includes("meta_narrated_warrant")) {
+                            flags.push("meta_narrated_warrant");
+                            notes["meta_narrated_warrant"] = `"${m[0].trim()}" — announces an inference rather than performing it. The warrant lives in the since/because/which clause, not in a sentence that announces what the warrant did.`;
+                        }
+                        break;
+                    }
+                }
+                for (const re of PRIORITY_PATTERNS) {
+                    const m = paraStripped.match(re);
+                    if (m) {
+                        flags.push("priority_warrant");
+                        notes["priority_warrant"] = `"${m[0].trim()}" — temporal precedence dressed as a warrant. Justify by what the analysis accomplishes, not when it was made.`;
+                        break;
+                    }
+                }
+                if (wc >= 80 && !INFERENTIAL_CONNECTIVE.test(paraStripped)) {
+                    flags.push("missing_inferential_clause");
+                    notes["missing_inferential_clause"] = `${wc}-word paragraph contains no inferential connective (since/because/which/if/unless/where/when/once). Paragraphs of this length usually argue; this one only asserts.`;
+                }
+
+                audited.push({
+                    n: i + 1,
+                    snippet: para.slice(0, 200),
+                    word_count: wc,
+                    flags,
+                    notes,
+                });
+            }
+
+            let deep_called = 0;
+            if (deep) {
+                const anth = getAnthropic();
+                if (!anth) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({
+                                error: "deep=true requires ANTHROPIC_API_KEY in the MCP server's env. Set it in the deployment environment and restart. Shallow mode (deep=false) works without the key.",
+                            }, null, 2),
+                        }],
+                    };
+                }
+                const SYSTEM_PROMPT = `You audit one paragraph from a scholarly philosophy essay against Toulmin's six elements of argument.
+
+Identify each element if present in the paragraph:
+- Claim: the proposition the paragraph asks the reader to accept.
+- Grounds: the evidence/text/cited material the claim rests on.
+- Warrant: the inferential bridge from grounds to claim. The warrant lives INSIDE the inferential clause (since/because/which/if) of the sentence that does the inferring. A sentence announcing an inference (e.g. "this shows that...", "X explains why...") is NOT a warrant — that is meta-narration of a warrant.
+- Backing: prior apparatus or definition that licenses the warrant.
+- Qualifier: words that scope the claim (on X's account, in so far as, to the degree that).
+- Rebuttal: acknowledged exception or counter-condition.
+
+If the warrant is absent, fabricated as meta-narration, tautological, or substituted by a priority/precedent claim, set warrant to null and warrant_failure to one of: "missing", "meta_narrated", "tautological", "priority_based", "skipped". Then propose ONE sentence that would license the paragraph's claim from its grounds, written in inferential-clause shape (since X, because Y, which Z).
+
+Output strict JSON only, no preamble:
+
+{"claim": string|null, "grounds": string|null, "warrant": string|null, "backing": string|null, "qualifier": string|null, "rebuttal": string|null, "warrant_failure": null|"missing"|"meta_narrated"|"tautological"|"priority_based"|"skipped", "suggested_warrant": string|null}`;
+                for (const pa of audited) {
+                    try {
+                        const msg = await anth.messages.create({
+                            model: model || "claude-haiku-4-5-20251001",
+                            max_tokens: 800,
+                            system: SYSTEM_PROMPT,
+                            messages: [{ role: "user", content: rawParas[pa.n - 1] }],
+                        });
+                        deep_called += 1;
+                        const text = msg.content
+                            .filter((b: any) => b.type === "text")
+                            .map((b: any) => b.text)
+                            .join("");
+                        const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+                        let parsed: any;
+                        try { parsed = JSON.parse(cleaned); }
+                        catch {
+                            pa.notes["_deep_parse_error"] = "Anthropic returned non-JSON; element decomposition skipped for this paragraph.";
+                            continue;
+                        }
+                        pa.elements = {
+                            claim: parsed.claim ?? null,
+                            grounds: parsed.grounds ?? null,
+                            warrant: parsed.warrant ?? null,
+                            backing: parsed.backing ?? null,
+                            qualifier: parsed.qualifier ?? null,
+                            rebuttal: parsed.rebuttal ?? null,
+                        };
+                        pa.warrant_failure = parsed.warrant_failure ?? null;
+                        pa.suggested_warrant = parsed.suggested_warrant ?? null;
+                        if (parsed.warrant_failure && !pa.flags.includes(`warrant_failure_${parsed.warrant_failure}`)) {
+                            pa.flags.push(`warrant_failure_${parsed.warrant_failure}`);
+                        }
+                    } catch (err) {
+                        pa.notes["_deep_call_error"] = _errStr(err);
+                    }
+                }
+            }
+
+            const flag_counts: Record<string, number> = {};
+            let paragraphs_with_warrant_failure = 0;
+            for (const pa of audited) {
+                let para_has_failure = false;
+                for (const f of pa.flags) {
+                    flag_counts[f] = (flag_counts[f] || 0) + 1;
+                    if (f.startsWith("warrant_failure_") || f === "meta_narrated_warrant" || f === "priority_warrant" || f === "missing_inferential_clause") {
+                        para_has_failure = true;
+                    }
+                }
+                if (para_has_failure) paragraphs_with_warrant_failure += 1;
+            }
+
+            let history_id: string | null = null;
+            if (project_slug) {
+                try {
+                    const ins = await supabase
+                        .from("drafts_toulmin_history")
+                        .insert({
+                            project_slug,
+                            draft: draft.slice(0, 200_000),
+                            audit: { paragraphs: audited, summary: { flag_counts, paragraphs_with_warrant_failure, deep_called } },
+                        })
+                        .select("id")
+                        .single();
+                    if (!ins.error && ins.data) history_id = (ins.data as any).id;
+                } catch (_e) {
+                    // Soft fail — the table may not exist yet.
+                }
+            }
+
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        success: true,
+                        paragraphs: rawParas.length,
+                        paragraphs_audited: audited,
+                        summary: {
+                            flag_counts,
+                            paragraphs_with_warrant_failure,
+                            deep_mode_paragraphs_called: deep_called,
+                        },
+                        history_id,
+                    }, null, 2),
+                }],
+            };
+        } catch (err) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: _errStr(err) }) }] };
+        }
+    },
+);
+
 // Companion tool: explicit lookup of past (rejected, chosen) pairs by similarity to a target draft.
 // Topic-sentence method (Rule 5) as its own tool — diagnose each paragraph's
 // opener and propose move-making rewrites. Diagnosis + Claude rewrites run in the

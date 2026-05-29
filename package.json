@@ -12,6 +12,7 @@
     "dev:http": "tsc && node dist/http.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@supabase/supabase-js": "^2.39.0",
     "express": "^5.2.1",
