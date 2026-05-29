@@ -1797,6 +1797,21 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
             const idx = paraStripped.search(/—|–|--/);
             violations.push({ rule: "em_dash", paragraph: pNum, snippet: para.slice(Math.max(0, idx - 40), idx + 41).trim() });
         }
+        // Colons in author voice are banned (see §Colons in composition-style).
+        {
+            const colonRe = /(?<!\bhttps?)(?<!\d):\s+(?=["'‘’“”\w])/g;
+            let cm: RegExpExecArray | null;
+            const noCites = paraStripped.replace(/\([^)]{1,120}\)/g, "");
+            while ((cm = colonRe.exec(noCites)) !== null) {
+                const idx = cm.index;
+                violations.push({
+                    rule: "colon_in_author_voice",
+                    paragraph: pNum,
+                    snippet: noCites.slice(Math.max(0, idx - 40), idx + 50).trim(),
+                    note: "colons are an AI tell in this voice — subordinate the second clause (since/because/which), split into two sentences, or recast so the payoff arrives without being announced",
+                });
+            }
+        }
         const lower = para.toLowerCase();
         // Banned words
         for (const w of BANNED_WORDS) {
