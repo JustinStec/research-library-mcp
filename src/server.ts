@@ -1985,22 +1985,36 @@ server.tool("drafts_check_style", "Audit a draft against Justin's composition-st
                     });
                 }
             }
-            // Coordinated-conjunction handoff opener (Rule 5) — at S1 of paragraph.
-            // Also flagged as body-sentence variant for all other sentences (Rule 6).
-            // Pattern: "...something..., and [Proper noun] [verb]s..." where the
-            // proper noun is a fresh subject not the prior clause's subject.
-            const coordHandoff = s.match(/^[^,]{10,}?,\s+and\s+([A-Z][a-z]+)(?:'s|\s+([a-z]+(?:s|ed)))/);
+            // Coordinated-conjunction handoff (Rules 5 & 6).
+            // Old narrow regex required a Proper Noun immediately after ", and "
+            // and missed the broader pattern: any independent clause welded to
+            // another with ", and " — e.g.
+            //   "...consciousness as the place the pressing goes on, and on
+            //    Eliot's account no such place exists."
+            // The structural failure is two argumentative beats joined by
+            // comma-and, regardless of whether the second clause's subject is
+            // a Proper Noun, a determiner-noun ("the X"), a pronoun ("it"),
+            // or a fronted prepositional phrase ("on X's account, no Y exists").
+            const coordHandoff = s.match(/^([^,]{15,}?),\s+and\s+([^.!?]{15,}?)\s*[.!?]?\s*$/);
             if (coordHandoff) {
-                const isOpener = sIdx === 0;
-                violations.push({
-                    rule: isOpener ? "coord_and_handoff_opener" : "coord_and_handoff_body",
-                    paragraph: pNum,
-                    sentence: sIdx + 1,
-                    snippet: s.slice(0, 120),
-                    note: isOpener
-                        ? "[setup], and [source] [verb]s it — fold handoff in subordinately or split into two sentences"
-                        : "two beats joined with 'and' inside one sentence — subordinate the second beat or split",
-                });
+                const second = coordHandoff[2];
+                const hasFiniteVerb =
+                    /\b(?:is|are|was|were|am|be|been|being|do|does|did|done|has|have|had|will|would|can|could|should|shall|may|might|must|ought)\b/i.test(second) ||
+                    /\b(?:exists?|works?|holds?|shows?|fails?|leaves?|drops?|runs?|requires?|matters?|follows?|reads?|writes?|takes?|gives?|means?|needs?|seems?|appears?|points?|stands?|opens?|closes?|misses?|misleads?|carries?|bears?|wins?|loses?|denies?|grants?|stays?|breaks?|joins?|owes?|knows?|forgets?|remains?|begins?|ends?|raises?|risks?|settles?|annihilates?|retires?|removes?|substitutes?|replaces?|tracks?|registers?)\b/i.test(second) ||
+                    /\b\w{3,}(?:s|ed|es)\b\s+\w/.test(second);
+                const looksLikeListItem = /^[a-zA-Z][a-zA-Z\s-]{0,40}$/.test(second) && !hasFiniteVerb;
+                if (hasFiniteVerb && !looksLikeListItem) {
+                    const isOpener = sIdx === 0;
+                    violations.push({
+                        rule: isOpener ? "coord_and_handoff_opener" : "coord_and_handoff_body",
+                        paragraph: pNum,
+                        sentence: sIdx + 1,
+                        snippet: s.slice(0, 160),
+                        note: isOpener
+                            ? "[setup], and [second clause] — fold the handoff in subordinately (where/since/which/because) or split into two sentences."
+                            : "two argumentative beats joined by ', and' — subordinate the second beat (where/since/which/because/once) or split into two sentences. The reflexive comma-and coordination is the tic.",
+                    });
+                }
             }
             // Mid-sentence citation (Rule 8)
             const citeRe = /\(\s*[A-Z][a-zA-Z'’-]+(?:\s+(?:and|&|et\s+al\.?)\s+[A-Z][a-zA-Z'’-]+)?(?:\s*\[\s*\d{4}[a-z]?\s*\])?\s+\d{4}[a-z]?(?:\s*,\s*\d+(?:[-–]\d+)?[a-z]?)?\s*\)/g;
