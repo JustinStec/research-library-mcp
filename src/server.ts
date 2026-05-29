@@ -3358,6 +3358,115 @@ Be conservative with reorderings — only flag changes that genuinely improve th
     },
 );
 
+// ============================================================================
+// drafts_dependency_arrangement_audit — emergent structure from warrants
+// ============================================================================
+server.tool(
+    "drafts_dependency_arrangement_audit",
+    "Whole-article dependency-arrangement audit. Strips section markers, identifies each paragraph's Toulmin claim+warrant, builds the directed dependency graph across paragraphs (edge A→B means B's warrant requires A's claim as grounds), then derives: topological order, forward edges (ordering bugs), cycles (circular reasoning or redundancy), clusters (candidate sections), roots, leaves (candidate cuts), and a proposed TOC. Generates a structure FROM SCRATCH rather than refining the current one — use as a SECOND OPINION against drafts_article_structure_audit. Default Opus 4.8 (~$1, ~150s); Sonnet 4.6 fallback ~$0.20. Requires ANTHROPIC_API_KEY.",
+    {
+        draft: z.string().describe("The whole article (markdown or plain). Section markers will be stripped before analysis."),
+        project_slug: z.string().optional().describe("Optional project slug for persistence to drafts_dependency_arrangement_history."),
+        model: z.string().optional().default("claude-opus-4-8").describe("Anthropic model. Default Opus 4.8 (recommended); pass claude-sonnet-4-6 for cheaper but coarser analysis."),
+    },
+    async ({ draft, project_slug, model }) => {
+        try {
+            const anth = getAnthropic();
+            if (!anth) {
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: "drafts_dependency_arrangement_audit requires ANTHROPIC_API_KEY in the MCP server's env." }, null, 2) }],
+                };
+            }
+            const rawParas = draft.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+            const sectionRe = /^#{0,4}\s*(?:Section\s+)?([IVXLCDM]+)\.?\s*$/i;
+            const proseParas: string[] = [];
+            const skippedHeaders: string[] = [];
+            for (const p of rawParas) {
+                const m = p.match(sectionRe);
+                if (m && p.length < 40) { skippedHeaders.push(p.trim()); }
+                else { proseParas.push(p); }
+            }
+            const numbered = proseParas.map((p, i) => `[¶${i + 1}]\n${p}`).join("\n\n");
+
+            const SYSTEM_PROMPT = `You audit the dependency structure of a scholarly philosophy article. The article is given as numbered paragraphs ([¶1], [¶2], …) WITHOUT section markers — they have been stripped on purpose. Your job is to derive the structure the argument REQUIRES from the dependencies among paragraphs, not to evaluate the order in which they currently appear.
+
+For each paragraph, identify the Toulmin CLAIM and a brief description of its WARRANT (the inferential principle that licenses the claim from its grounds). Then identify which OTHER paragraphs' claims serve as grounds for this paragraph's warrant — i.e., paragraphs whose claims must hold for this paragraph's warrant to license its claim.
+
+Critical distinction: A logical dependency means the paragraph's warrant REQUIRES the prior paragraph's claim. A topical adjacency (they discuss the same source, the same example) is NOT a dependency. Emit only logical dependencies. When in doubt, do not emit an edge.
+
+From the dependency graph, derive: topological order, forward_edges (deps point forward in prose), cycles, clusters (candidate sections), roots (no incoming deps — introduce threads), leaves (no outgoing deps — conclusions or dead ends).
+
+Output strict JSON only, no preamble:
+
+{
+  "paragraphs": [{"n": int, "claim": string, "warrant_summary": string, "ground_paragraphs": int[], "kind": "introduces_thread" | "develops_thread" | "synthesizes" | "applies_apparatus" | "raises_objection" | "replies_to_objection" | "concludes"}],
+  "dependencies": [{"from": int, "to": int, "type": "supports" | "specifies" | "applies" | "challenges", "strength": "strong" | "moderate" | "weak"}],
+  "forward_edges": [{"paragraph": int, "depends_on_paragraph": int, "issue": string, "fix": string}],
+  "cycles": [{"paragraphs": int[], "kind": "circular_reasoning" | "redundancy" | "mutual_definition", "diagnosis": string, "fix": string}],
+  "clusters": [{"label": string, "paragraphs": int[], "shared_grounds": string, "argumentative_role": string}],
+  "roots": [{"paragraph": int, "introduces": string}],
+  "leaves": [{"paragraph": int, "concludes": string, "load_bearing": "yes" | "candidate_cut" | "no_but_required"}],
+  "topological_order": int[],
+  "proposed_table_of_contents": [{"section": string, "argumentative_role": string, "paragraphs": int[], "rationale": string}],
+  "comparison_to_current_prose_order": {"agreements": string, "biggest_disagreements": string, "stable_clusters_match_prose": boolean, "verdict": "current_order_well_motivated" | "current_order_mostly_right" | "significant_rearrangement_warranted" | "fundamental_restructure_needed"},
+  "highest_leverage_rearrangement": string,
+  "dependency_assessment": string
+}
+
+Be conservative — emit a dependency edge only when the warrant genuinely requires the prior claim. The default is "no edge." Topological_order should include every paragraph exactly once. Sections may have any number; do not assume four. dependency_assessment is one paragraph (≤200 words).`;
+
+            const msg = await anth.messages.create({
+                model: model || "claude-opus-4-8",
+                max_tokens: 20000,
+                system: SYSTEM_PROMPT,
+                messages: [{ role: "user", content: numbered }],
+            });
+            const text = msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+            const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+            const firstBrace = cleaned.indexOf("{");
+            const lastBrace = cleaned.lastIndexOf("}");
+            const jsonSpan = (firstBrace >= 0 && lastBrace > firstBrace) ? cleaned.slice(firstBrace, lastBrace + 1) : cleaned;
+            let parsed: any;
+            try { parsed = JSON.parse(jsonSpan); }
+            catch {
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: "Anthropic returned non-JSON (likely truncated at max_tokens). Stop reason: " + (msg.stop_reason || "?") + ". Raw head: " + text.slice(0, 400) + " ... Raw tail: " + text.slice(-200) }, null, 2) }],
+                };
+            }
+
+            let history_id: string | null = null;
+            if (project_slug) {
+                try {
+                    const ins = await supabase
+                        .from("drafts_dependency_arrangement_history")
+                        .insert({ project_slug, draft: draft.slice(0, 400_000), audit: parsed })
+                        .select("id")
+                        .single();
+                    if (!ins.error && ins.data) history_id = (ins.data as any).id;
+                } catch (_e) {}
+            }
+
+            const u = msg.usage;
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        success: true,
+                        total_paragraphs: proseParas.length,
+                        section_headers_stripped: skippedHeaders,
+                        model_used: model || "claude-opus-4-8",
+                        tokens: { input: u.input_tokens, output: u.output_tokens },
+                        ...parsed,
+                        history_id,
+                    }, null, 2),
+                }],
+            };
+        } catch (err) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: _errStr(err) }) }] };
+        }
+    },
+);
+
 // Companion tool: explicit lookup of past (rejected, chosen) pairs by similarity to a target draft.
 // Topic-sentence method (Rule 5) as its own tool — diagnose each paragraph's
 // opener and propose move-making rewrites. Diagnosis + Claude rewrites run in the
