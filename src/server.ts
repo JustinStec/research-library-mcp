@@ -2838,7 +2838,10 @@ server.tool(
 - "suggested_substitution" is the specific noun phrase to replace the pronoun with, in the prose's own vocabulary. null when ambiguity is "clear".
 - sentence_idx is 0-based within the paragraph.`;
                 for (const pa of audited) {
-                    if (pa.flags.length === 0) continue;
+                    // Deep-resolve EVERY paragraph, not only regex-flagged ones —
+                    // deep resolution is most valuable on the quiet ambiguities the
+                    // count-based regex can't see (a lone "it" with two candidate
+                    // antecedents). Matches drafts_toulmin_audit's unconditional deep run.
                     try {
                         const msg = await anth.messages.create({
                             model: model || "claude-haiku-4-5-20251001",
